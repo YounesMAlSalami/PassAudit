@@ -438,6 +438,9 @@ def audit_windows_sam_direct(
         os.chmod(tmp, 0o700)
     except (AttributeError, OSError):
         pass
+    if os.name == "nt":
+        from .sam_reader import _restrict_windows_temp_directory
+        _restrict_windows_temp_directory(tmp)
     sam_path = os.path.join(tmp, "SAM.save")
     system_path = os.path.join(tmp, "SYSTEM.save")
 

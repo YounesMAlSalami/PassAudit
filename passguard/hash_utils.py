@@ -78,6 +78,14 @@ except ImportError:
     # Python 3.13+ أزالت crypt
     _HAS_CRYPT = False
 
+    # --- yescrypt (maintained optional backend) ---
+    try:
+        import yescrypt as _yescrypt
+        _HAS_YESCRYPT = True
+    except Exception:
+        _yescrypt = None
+        _HAS_YESCRYPT = False
+
 
 def get_hash_backend() -> str:
     """إرجاع اسم backend النشط لتجزئة Unix:
@@ -85,6 +93,8 @@ def get_hash_backend() -> str:
     """
     if _HAS_PASSLIB:
         return "passlib"
+    if _HAS_YESCRYPT:
+        return "yescrypt"
     if _HAS_CRYPT:
         return "crypt"
     return "none"
@@ -214,6 +224,13 @@ except Exception:  # pragma: no cover
     _passlib_nthash = None
     _HAS_PASSLIB_NTLM = False
 
+try:
+    from Cryptodome.Hash import MD4 as _cryptodome_md4
+    _HAS_CRYPTODOME_MD4 = True
+except Exception:
+    _cryptodome_md4 = None
+    _HAS_CRYPTODOME_MD4 = False
+
 
 def compute_ntlm(password: str) -> str:
     """
@@ -230,6 +247,11 @@ def compute_ntlm(password: str) -> str:
     if password is None:
         password = ""
     utf16 = password.encode("utf-16-le")
+    if _HAS_CRYPTODOME_MD4:
+        try:
+            return _cryptodome_md4.new(utf16).hexdigest().upper()
+        except Exception:
+            pass
     if _HAS_PASSLIB_NTLM:
         try:
             return _passlib_nthash.hash(password).upper()
@@ -297,9 +319,16 @@ def parse_unix_hash_field(field: str) -> Optional[dict]:
         hash_part = parts[-1]
         remaining = parts[2:-1]
         parameters = {}
-        salt = remaining[-1] if remaining else None
-        if remaining and remaining[0].startswith("rounds="):
+        if algo_id == "y":
+            setting = remaining[0] if remaining else None
+            salt = remaining[1] if len(remaining) > 1 else None
+            if setting:
+                parameters["setting"] = setting
+        elif remaining and remaining[0].startswith("rounds="):
             parameters["rounds"] = remaining[0].split("=", 1)[1]
+            salt = remaining[-1] if remaining else None
+        else:
+            salt = remaining[-1] if remaining else None
         return {
             "raw": field,
             "algo_id": algo_id,
@@ -334,6 +363,28 @@ def can_verify_algo(algo_id: Optional[str]) -> bool:
     """Return whether the active backend was actually verified for this format."""
     if not algo_id:
         return False
+    if algo_id in {"y", "gy"} and _HAS_CRYPT:
+        try:
+            test_hash = _crypt_module.crypt(
+                "PassGuardCapabilityProbe",
+                "$y$j9T$passguard$",
+            )
+            if test_hash and hmac.compare_digest(
+                test_hash,
+                _crypt_module.crypt("PassGuardCapabilityProbe", test_hash),
+            ):
+                return True
+        except Exception:
+            pass
+    if algo_id in {"y", "gy"} and _HAS_YESCRYPT:
+        try:
+            test_hash = _yescrypt.hash_password(
+                "PassGuardCapabilityProbe",
+                salt=b"passguard",
+            )
+            return bool(_yescrypt.verify("PassGuardCapabilityProbe", test_hash))
+        except Exception:
+            return False
     if _HAS_PASSLIB:
         passlib_map = {
             "1": "md5_crypt",
@@ -383,6 +434,29 @@ def verify_unix_hash(password: str, full_field: str) -> Tuple[bool, str]:
     parsed = parse_unix_hash_field(full_field)
     if parsed and parsed.get("status") == "unknown":
         return (False, "unsupported")
+
+    # yescrypt verification using the maintained yescrypt package.
+    if parsed and parsed.get("algo_id") in {"y", "gy"}:
+        # On Linux, prefer the system libcrypt implementation (native yescrypt).
+        if _HAS_CRYPT:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    computed = _crypt_module.crypt(password, full_field)
+                if computed is not None:
+                    if hmac.compare_digest(computed, full_field):
+                        return (True, "matched")
+                    return (False, "no_match")
+            except Exception:
+                pass
+        if not _HAS_YESCRYPT:
+            return (False, "unsupported")
+        try:
+            if _yescrypt.verify(password, full_field):
+                return (True, "matched")
+            return (False, "no_match")
+        except Exception:
+            return (False, "unsupported")
 
     # --- مسار passlib ---
     if _HAS_PASSLIB:

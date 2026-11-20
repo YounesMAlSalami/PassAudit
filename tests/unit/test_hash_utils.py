@@ -40,9 +40,16 @@ def test_sha512_real_verification_when_supported():
     assert verify_unix_hash("wrong-password", field) == (False, "no_match")
 
 
-def test_yescrypt_is_explicitly_not_assessed():
-    field = "$y$j9T$salt$checksum"
+def test_yescrypt_real_verification_when_backend_available():
+    try:
+        import yescrypt
+    except ImportError:
+        assert not can_verify_algo("y")
+        return
+
+    field = yescrypt.hash_password("12345678")
     parsed = parse_unix_hash_field(field)
     assert parsed["algo_name"] == "YESCRYPT"
-    assert not can_verify_algo("y")
-    assert verify_unix_hash("12345678", field) == (False, "unsupported")
+    assert can_verify_algo("y")
+    assert verify_unix_hash("12345678", field) == (True, "matched")
+    assert verify_unix_hash("wrong-password", field) == (False, "no_match")

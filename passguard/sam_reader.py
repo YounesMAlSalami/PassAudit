@@ -564,6 +564,19 @@ _QWERTY = b"!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\x00"
 _DIGITS = b"0123456789012345678901234567890123456789\x00"
 
 
+def detect_sam_revision(f_data: bytes) -> str:
+    """Identify the custom legacy SAM format used by this implementation."""
+    if len(f_data) < 0x90:
+        return "invalid-f-record"
+
+    revision = struct.unpack_from("<I", f_data, 0x60)[0]
+    if revision == 1:
+        return "legacy-rc4-des-revision-1"
+    if revision == 2:
+        return "legacy-rc4-des-revision-2"
+    return "unsupported-modern-or-unrecognized"
+
+
 def extract_bootkey(system_hive: RegistryHive) -> bytes:
     """استخراج boot key من خلية SYSTEM.
 
@@ -627,6 +640,12 @@ def extract_hbootkey(sam_hive: RegistryHive, bootkey: bytes) -> bytes:
         raise ValueError("قيمة F مفقودة أو قصيرة جداً في Domains\\Account.")
 
     f_data = f_val.data
+    revision = detect_sam_revision(f_data)
+    if revision not in {"legacy-rc4-des-revision-1", "legacy-rc4-des-revision-2"}:
+        raise ValueError(
+            "Unsupported or unverified SAM format: "
+            f"{revision}. Live NT hash extraction is not supported."
+        )
     # revision عند الإزاحة 0x60 (4 بايت)، HBootKey مشفّر عند 0x70 (0x20 بايت)
     # وفق impacket/creddump
     revision = f_data[0x60:0x64]
@@ -921,6 +940,32 @@ def _enable_privilege(privilege_name: str) -> bool:
         ctypes.windll.kernel32.CloseHandle(token)
 
 
+def _restrict_windows_temp_directory(directory: str) -> None:
+    """Restrict a Windows temporary directory to the current user."""
+    if not is_windows():
+        return
+    import subprocess
+
+    username = os.environ.get("USERNAME")
+    if not username:
+        return
+    try:
+        subprocess.run(
+            [
+                "icacls",
+                directory,
+                "/inheritance:r",
+                "/grant:r",
+                f"{username}:(OI)(CI)(F)",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
 def read_sam_hashes(output_dir: Optional[str] = None) -> List[dict]:
     """قراءة تجزئات SAM مباشرة من نظام Windows الحالي.
 
@@ -955,6 +1000,8 @@ def read_sam_hashes(output_dir: Optional[str] = None) -> List[dict]:
         os.chmod(tmp, 0o700)
     except (AttributeError, OSError):
         pass
+    if is_windows():
+        _restrict_windows_temp_directory(tmp)
     sam_path = os.path.join(tmp, "SAM.save")
     system_path = os.path.join(tmp, "SYSTEM.save")
 
@@ -995,4 +1042,5 @@ __all__ = [
     "hashes_to_pwdump",
     # Windows API
     "save_registry_hive", "is_windows", "is_admin",
+    "detect_sam_revision",
 ]
