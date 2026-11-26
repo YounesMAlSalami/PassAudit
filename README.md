@@ -19,10 +19,25 @@ Use PassGuard only on systems and accounts you own or are explicitly authorized 
 ### Kali Linux
 
 ![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (166).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (167).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (178).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (179).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (181).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (182).png>)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (183).png>)
+
+
 
 ### Windows
 
 ![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (184).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (185).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (186).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (188).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (189).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (191).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (192).png>)
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (193).png>)
 
 ## Supported Platforms and Audits
 
