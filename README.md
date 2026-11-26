@@ -14,30 +14,111 @@ Use PassGuard only on systems and accounts you own or are explicitly authorized 
 - Store reports locally in SQLite and reopen, re-export, or delete them.
 - Run an interactive Linux, Windows, or candidate-check menu through the CLI.
 
+
 ## Screenshots
 
 ### Kali Linux
 
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (166).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (167).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (178).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (179).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (181).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (182).png>)
-![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (183).png>)
-
-
+<table>
+  <tr>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (166).png" width="460" alt="PassGuard on Kali Linux - screenshot 166"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 1</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (167).png" width="460" alt="PassGuard on Kali Linux - screenshot 167"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 2</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (178).png" width="460" alt="PassGuard on Kali Linux - screenshot 178"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 3</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (179).png" width="460" alt="PassGuard on Kali Linux - screenshot 179"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 4</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (181).png" width="460" alt="PassGuard on Kali Linux - screenshot 181"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 5</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (182).png" width="460" alt="PassGuard on Kali Linux - screenshot 182"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 6</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/kali/‏‏لقطة الشاشة (183).png" width="460" alt="PassGuard on Kali Linux - screenshot 183"/>
+      <br/>
+      <sub>Kali Linux — Screenshot 7</sub>
+    </td>
+    <td></td>
+  </tr>
+</table>
 
 ### Windows
 
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (184).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (185).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (186).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (188).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (189).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (191).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (192).png>)
-![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (193).png>)
+<table>
+  <tr>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (184).png" width="460" alt="PassGuard on Windows - screenshot 184"/>
+      <br/>
+      <sub>Windows — Screenshot 1</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (185).png" width="460" alt="PassGuard on Windows - screenshot 185"/>
+      <br/>
+      <sub>Windows — Screenshot 2</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (186).png" width="460" alt="PassGuard on Windows - screenshot 186"/>
+      <br/>
+      <sub>Windows — Screenshot 3</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (188).png" width="460" alt="PassGuard on Windows - screenshot 188"/>
+      <br/>
+      <sub>Windows — Screenshot 4</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (189).png" width="460" alt="PassGuard on Windows - screenshot 189"/>
+      <br/>
+      <sub>Windows — Screenshot 5</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (191).png" width="460" alt="PassGuard on Windows - screenshot 191"/>
+      <br/>
+      <sub>Windows — Screenshot 6</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (192).png" width="460" alt="PassGuard on Windows - screenshot 192"/>
+      <br/>
+      <sub>Windows — Screenshot 7</sub>
+    </td>
+    <td align="center">
+      <img src="Assets/windows/‏‏لقطة الشاشة (193).png" width="460" alt="PassGuard on Windows - screenshot 193"/>
+      <br/>
+      <sub>Windows — Screenshot 8</sub>
+    </td>
+  </tr>
+</table>
+
 
 ## Supported Platforms and Audits
 
