@@ -337,7 +337,9 @@ Replace `C:\Path\To\PassGuard` below with the location where you cloned or extra
 cd "C:\Path\To\PassGuard"
 .\.venv\Scripts\Activate.ps1
 python main.py
-OR 
+```
+OR
+```powershell
 .\.venv\Scripts\python.exe main.py
 ```
 
