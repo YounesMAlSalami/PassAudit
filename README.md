@@ -440,17 +440,37 @@ requirements.txt
 README.md
 ```
 
-## Limitations and Security Considerations
 
-- The Linux GUI currently calls `audit_linux_shadow` with stop-event and resource-limit parameters that the Linux implementation does not accept. The GUI signature check therefore blocks that workflow before starting the Linux audit.
-- The Linux CLI calls `audit_linux_shadow` without those unsupported parameters and is the currently compatible Linux account-audit interface.
-- The Windows GUI and CLI call the Windows audit without GUI-style candidate limits or a progress callback; the detailed Windows function supports limits internally, but the GUI worker shown in `passguard/gui.py` does not pass them.
-- A non-match means no candidate from the supplied wordlist matched. It is not a guarantee of password strength.
-- Unsupported and failed hash checks are not successful audits and must not be classified as strong passwords.
-- Password-strength scoring is heuristic. The fallback can differ from `zxcvbn`, and a search-space estimate is not a real attacker-cost or compromise assessment.
-- Live compatibility is limited by operating-system policy, installed libraries, account hash formats, registry access, and parser support.
-- Reports retain usernames and sanitized audit metadata. They do not retain plaintext passwords or complete hashes.
-- The `reports` directory and SQLite database are local application artifacts and may contain sensitive account metadata.
+## Technical Notes and Limitations
+
+- **Linux GUI audit:** The current GUI implementation passes stop-event and resource-limit parameters that the Linux audit function does not accept. As a result, the Linux GUI audit workflow is currently blocked by a function signature mismatch.
+- **Linux CLI audit:** The Linux CLI calls the audit function without the unsupported parameters and is the currently compatible interface for local Linux account auditing.
+- **Windows audit:** The Windows auditor requires elevated privileges and access to the local SAM and SYSTEM registry hives. Successful extraction and parsing may depend on Windows configuration, registry policy, and `pypykatz` compatibility.
+- **Hash format support:** The Linux audit verifier supports SHA-512 crypt, SHA-256 crypt, MD5 crypt, traditional DES crypt, and yescrypt when the required package is installed. Unsupported hash formats must not be treated as successful password audits.
+- **Password strength estimation:** Strength scores are heuristic estimates. The fallback implementation may produce different results from `zxcvbn`, and estimated search space does not represent actual attacker cost.
+- **Wordlist checks:** A match indicates that a candidate appears in the configured local wordlist. A non-match does not prove that the password is strong or uncompromised.
+- **Audit coverage:** Results depend on the available input data, operating-system permissions, supported hash formats, installed dependencies, and parser compatibility.
+- **Report storage:** Audit history is stored locally in SQLite under the `reports` directory. Report files and database records may contain sensitive account metadata and should be protected.
+- **Test coverage:** Automated tests cover selected functionality, including password utilities, wordlist lookup, report redaction, exports, NT hash validation, and audit-history operations. They do not replace live integration testing against actual Linux shadow files or Windows SAM data.
+
+
+
+## Limitations and Responsible Use
+
+PassGuard is intended for educational, defensive, and authorized password-auditing activities.
+
+- **Authorization:** Use PassGuard only on systems, accounts, and credential data that you own or are explicitly authorized to audit.
+- **Sensitive data:** Passwords, password hashes, SAM/SYSTEM hive files, audit reports, and audit-history databases must be treated as sensitive information.
+- **Credential protection:** Do not share or publish plaintext passwords, complete password hashes, exported credential files, or reports containing sensitive account information.
+- **Report handling:** Store exported reports securely and review their contents before sharing them. Delete temporary credential files and reports when they are no longer required, in accordance with applicable data-handling policies.
+- **Privilege management:** Run PassGuard with only the permissions required for the selected audit. Do not weaken system security settings or change protected file permissions to bypass access controls.
+- **Interpretation of results:** A successful audit, a high strength score, or the absence of wordlist matches does not guarantee that a password or system is secure.
+- **Verification:** Review important findings and validate them using appropriate security procedures. Unsupported or failed hash checks must not be interpreted as evidence of strong passwords.
+- **Legal and ethical use:** The user is responsible for obtaining proper authorization and complying with applicable laws, regulations, and organizational policies.
+
+PassGuard is provided for educational and defensive purposes. The project does not guarantee the detection of every weak password or the prevention of unauthorized access.
+
+
 
 ## License
 
