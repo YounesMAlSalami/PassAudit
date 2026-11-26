@@ -1,525 +1,502 @@
-"""
-passguard.linux_auditor
-=======================
 
-وحدة تدقيق كلمات مرور أنظمة Linux عبر قراءة /etc/shadow.
-
-سير العمل:
-  1. قراءة /etc/shadow (يتطلب صلاحيات root: sudo).
-  2. قراءة /etc/passwd لاستبعاد حسابات النظام (UID < min_uid).
-  3. لكل حساب نشط (status="active")، نأخذ حقل التجزئة الكامل
-     ($id$salt$hash) ونطبّق backend التجزئة (passlib/crypt) لكل كلمة في
-     القائمة. التطابق يعني أنّ كلمة المرور الخاصة بالمستخدم هي تلك الكلمة.
-  4. التوازي: كل مستخدم له ملح مستقل، لذا نُوزّع المستخدمين على دفعات
-     (batches) على عمّال multiprocessing.Pool. كل عامل يقرأ القائمة مرة
-     واحدة ويفحص كل مستخدمي دفعته ضدّها — هذا يقلّل قراءة الملف من
-     N_users إلى N_batches.
-
-تحسينات Phase 3:
-  - إعادة استخدام القائمة: كل عامل يقرأ ملف القائمة مرة واحدة لكل دفعة
-    (لا لكل مستخدم).
-  - عزل الأخطاء: فشل مستخدم واحد لا يُنهي التدقيق كله.
-  - إلغاء: دعم cancel_event (multiprocessing.Event) لإيقاف التدقيق.
-  - تصنيف النتائج الواضح: weak/no_match/locked/disabled/empty/unknown/
-    error/not_assessed.
-  - backend التجزئة: استخدام verify_unix_hash لتمييز "unsupported" عن
-    "no_match".
-  - لا إجبار القائمة في الذاكرة: قراءة تدفّقية سطراً بسطر.
-
-الأمان:
-  - لا تُخزّن كلمات المرور الأصلية. المطابقات تُمرّر مُخفّاة.
-  - يستخدم hmac.compare_digest (داخل verify_unix_hash) لمقارنة ثابتة الزمن.
-  - الحسابات المقفلة/الفارغة تُسجّل بحالة مناسبة دون محاولة كسرها.
-
-ملاحظة عن الصلاحيات:
-  /etc/shadow عادةً بملكية root:shadow وبتصريح 640. لذا يجب تشغيل
-  الأداة بصلاحيات root (sudo).
-"""
-
+"""Linux /etc/shadow audit helpers."""
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
-import socket
 import time
-from typing import Callable, Dict, List, Optional
+import ctypes
+import ctypes.util
+import hmac
+import threading
 
-from .hash_utils import (
-    parse_unix_hash_field,
-    verify_unix_hash,
-    can_verify_algo,
-    get_hash_backend,
-    mask_password,
-    hash_summary_for_report,
-)
-from .reporter import AuditReport, Finding, DEFAULT_SEVERITY
-from .wordlist_loader import iter_wordlist, wordlist_stats
+from pathlib import Path
+from typing import Callable
 
-
-# ===========================================================================
-# قراءة /etc/passwd لاستبعاد حسابات النظام
-# ===========================================================================
-
-def _read_passwd_uids(passwd_path: str = "/etc/passwd") -> Dict[str, int]:
-    """قراءة /etc/passwd وإرجاع {username: uid}."""
-    uids: Dict[str, int] = {}
-    try:
-        with open(passwd_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                parts = line.rstrip("\n").split(":")
-                if len(parts) >= 3:
-                    try:
-                        uids[parts[0]] = int(parts[2])
-                    except ValueError:
-                        continue
-    except OSError:
-        pass
-    return uids
+from .config import WORDLIST_PATH
+from .wordlist import load_wordlist_candidates
+from .password_utils import mask_password
 
 
-def _read_shadow(shadow_path: str = "/etc/shadow") -> List[tuple]:
-    """قراءة /etc/shadow وإرجاع قائمة (username, hash_field, last_changed)."""
-    entries: List[tuple] = []
-    try:
-        with open(shadow_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                parts = line.rstrip("\n").split(":")
-                if len(parts) >= 2 and parts[0]:
-                    username = parts[0]
-                    hash_field = parts[1]
-                    last_changed = parts[2] if len(parts) > 2 else ""
-                    entries.append((username, hash_field, last_changed))
-    except PermissionError:
-        raise PermissionError(
-            f"صلاحية غير كافية لقراءة {shadow_path}. شغّل الأداة بصلاحيات root: "
-            f"sudo python -m passguard.main audit-linux ..."
+# Native crypt library cache
+_native_crypt_library = None
+_native_crypt = None
+
+
+def _get_native_crypt():
+    """Load the system crypt function once."""
+    global _native_crypt_library, _native_crypt
+
+    if _native_crypt is None:
+        library_name = ctypes.util.find_library("crypt")
+
+        if not library_name:
+            library_name = "libcrypt.so.1"
+
+        _native_crypt_library = ctypes.CDLL(library_name)
+        _native_crypt = _native_crypt_library.crypt
+
+        _native_crypt.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ]
+        _native_crypt.restype = ctypes.c_char_p
+
+    return _native_crypt
+
+
+def _verify_yescrypt_native(
+    password: str | bytes,
+    stored_hash: str | bytes,
+) -> bool:
+    """Verify a yescrypt hash using native system libcrypt."""
+
+    native_crypt = _get_native_crypt()
+
+    if isinstance(password, str):
+        password = password.encode("utf-8")
+
+    if isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode("ascii")
+
+    result = native_crypt(password, stored_hash)
+
+    if not result or result.startswith(b"*"):
+        raise RuntimeError(
+            "Native libcrypt failed to verify yescrypt hash"
         )
-    except OSError as e:
-        raise OSError(f"تعذّر قراءة {shadow_path}: {e}")
-    return entries
 
+    return hmac.compare_digest(result, stored_hash)
 
-# ===========================================================================
-# عامل توازي: فحص دفعة مستخدمين ضدّ القائمة (قراءة واحدة)
-# ===========================================================================
-
-def _audit_user_batch(args: tuple) -> List[dict]:
-    """
-    عامل multiprocessing: يفحص دفعة من المستخدمين ضدّ القائمة.
-
-    المعطيات: (users_batch, wordlist_path, case_fold, strip, cancel_flag)
-        users_batch: قائمة (username, hash_field)
-        wordlist_path: مسار ملف القائمة
-        case_fold: تطبيع الحالة
-        strip: إزالة المسافات
-        cancel_flag: multiprocessing.Value أو None للتحقّق من الإلغاء
-
-    يقرأ ملف القائمة مرة واحدة (تدفّقياً) ويفحص كل كلمة ضدّ كل مستخدمي
-    الدفعة. هذا يقلّل قراءة الملف من N_users إلى N_batches.
-
-    الإرجاع: قائمة نتائج (dict لكل مستخدم).
-    عزل الأخطاء: فشل مستخدم واحد لا يُنهي الدفعة.
-    """
-    users_batch, wordlist_path, case_fold, strip, cancel_flag = args
-
-    # تهيئة نتائج كل مستخدم بحالة افتراضية
-    # نستخدم قاموساً لمتابعة الحالة لكل مستخدم
-    results: List[dict] = []
-    pending: List[tuple] = []   # (index_in_results, username, hash_field)
-
-    for username, hash_field in users_batch:
-        result = _classify_account_initial(username, hash_field)
-        results.append(result)
-        # فقط الحسابات النشطة تحتاج فحص القائمة
-        if result["status"] == "active_pending":
-            pending.append((len(results) - 1, username, hash_field))
-
-    # إن لم تكن هناك حسابات نشطة، نُعيد النتائج فوراً
-    if not pending:
-        return results
-
-    # فحص القائمة: نقرأ الملف مرة واحدة ونتحقّق من كل كلمة ضدّ كل المستخدمين
-    # المعلّقين. بمجرّد العثور على تطابق لمستخدم، نُزيله من pending.
-    try:
-        for word in iter_wordlist(wordlist_path, case_fold=case_fold, strip=strip):
-            # التحقّق من الإلغاء
-            if cancel_flag is not None:
-                try:
-                    if cancel_flag.value:
-                        break
-                except Exception:
-                    pass
-            # نسخة من pending للتعديل أثناء التكرار
-            still_pending: List[tuple] = []
-            for idx, username, hash_field in pending:
-                try:
-                    matched, status = verify_unix_hash(word, hash_field)
-                except Exception:
-                    # خطأ في التحقق — نُسجّله لكنّنا نُكمل
-                    matched, status = False, "error"
-                if matched:
-                    results[idx] = {
-                        "username": username,
-                        "status": "weak",
-                        "algorithm": results[idx]["algorithm"],
-                        "matched": mask_password(word),
-                        "hash_preview": results[idx]["hash_preview"],
-                        "severity": "critical",
-                        "notes": "كلمة المرور مطابقة لإدخال في القائمة الشائعة.",
-                        "salt": results[idx].get("salt"),
-                        "rounds": results[idx].get("rounds"),
-                        "verification_backend": get_hash_backend(),
-                    }
-                elif status == "unsupported":
-                    # خوارزمية غير مدعومة — نُعلّم كـ not_assessed ونُزيل من pending
-                    results[idx] = {
-                        "username": username,
-                        "status": "not_assessed",
-                        "algorithm": results[idx]["algorithm"],
-                        "matched": None,
-                        "hash_preview": results[idx]["hash_preview"],
-                        "severity": "medium",
-                        "notes": "خوارزمية التجزئة غير مدعومة من backend النشط — تعذّر التحقق.",
-                        "salt": results[idx].get("salt"),
-                        "rounds": results[idx].get("rounds"),
-                        "verification_backend": get_hash_backend(),
-                    }
-                elif status == "error":
-                    results[idx] = {
-                        "username": username,
-                        "status": "error",
-                        "algorithm": results[idx]["algorithm"],
-                        "matched": None,
-                        "hash_preview": results[idx]["hash_preview"],
-                        "severity": "medium",
-                        "notes": "حدث خطأ أثناء التحقق من التجزئة.",
-                        "salt": results[idx].get("salt"),
-                        "rounds": results[idx].get("rounds"),
-                        "verification_backend": get_hash_backend(),
-                    }
-                else:
-                    # no_match حتى الآن — نُبقيه في pending لمتابعة الفحص
-                    still_pending.append((idx, username, hash_field))
-            pending = still_pending
-            # إن لم يبقَ مستخدمون معلّقون، نتوقّف مبكراً
-            if not pending:
-                break
-    except OSError as e:
-        # خطأ في قراءة ملف القائمة — نُعلّم كل المعلّقين كـ error
-        for idx, username, _ in pending:
-            results[idx] = {
-                "username": username,
-                "status": "error",
-                "algorithm": results[idx]["algorithm"],
-                "matched": None,
-                "hash_preview": results[idx]["hash_preview"],
-                "severity": "medium",
-                "notes": f"خطأ في قراءة ملف القائمة: {e}",
-                "salt": results[idx].get("salt"),
-                "rounds": results[idx].get("rounds"),
-                "verification_backend": get_hash_backend(),
-            }
-        return results
-
-    # المستخدمون المتبقّون في pending لم يطابقوا أي كلمة → no_match
-    # (هذا لا يعني أنّهم آمنون، فقط أنّ القائمة لم تكشفهم)
-    for idx, username, _ in pending:
-        results[idx] = {
-            "username": username,
-            "status": "no_match",
-            "algorithm": results[idx]["algorithm"],
-            "matched": None,
-            "hash_preview": results[idx]["hash_preview"],
-            "severity": "low",
-            "notes": "لم تُطابق أي كلمة في القائمة المُستخدمة — هذا لا يعني الأمان.",
-            "salt": results[idx].get("salt"),
-            "rounds": results[idx].get("rounds"),
-            "verification_backend": get_hash_backend(),
-        }
-
-    return results
-
-
-def _classify_account_initial(username: str, hash_field: str) -> dict:
-    """التصنيف الأوّلي للحساب قبل فحص القائمة."""
-    parsed = parse_unix_hash_field(hash_field)
-    if parsed is None:
-        return {"username": username, "status": "empty", "algorithm": "",
-                "matched": None, "hash_preview": "",
-                "severity": "info", "notes": "حقل فارغ",
-                "salt": None, "rounds": None,
-                "verification_backend": get_hash_backend()}
-
-    status = parsed["status"]
-    algo_name = parsed["algo_name"] or "Unknown"
-    algo_id = parsed.get("algo_id")
-    hash_preview = hash_summary_for_report(algo_name, hash_field)
-    salt = parsed.get("salt")
-    rounds = parsed.get("rounds")
-
-    if status == "active":
-        # نتأكّد أنّ backend يستطيع التحقق من هذه الخوارزمية قبل فحص القائمة
-        if not can_verify_algo(algo_id):
-            return {
-                "username": username, "status": "not_assessed",
-                "algorithm": algo_name,
-                "matched": None, "hash_preview": hash_preview,
-                "severity": "medium",
-                "notes": f"خوارزمية {algo_name} غير مدعومة من backend النشط ({get_hash_backend()}).",
-                "salt": salt, "rounds": rounds,
-                "verification_backend": get_hash_backend(),
-            }
-        # نُعيد حالة وسيطة تُشير لاحتياج فحص القائمة
-        return {
-            "username": username, "status": "active_pending",
-            "algorithm": algo_name,
-            "matched": None, "hash_preview": hash_preview,
-            "severity": "low", "notes": "",
-            "salt": salt, "rounds": rounds,
-            "verification_backend": get_hash_backend(),
-        }
-    elif status == "locked":
-        return {
-            "username": username, "status": "locked",
-            "algorithm": algo_name,
-            "matched": None, "hash_preview": hash_preview,
-            "severity": "info",
-            "notes": "الحساب مقفل أو كلمة المرور معطّلة (!/*).",
-            "salt": salt, "rounds": rounds,
-            "verification_backend": get_hash_backend(),
-        }
-    elif status == "empty":
-        return {
-            "username": username, "status": "empty",
-            "algorithm": algo_name,
-            "matched": None, "hash_preview": hash_preview,
-            "severity": "high",
-            "notes": "لا توجد كلمة مرور مضبوطة للحساب.",
-            "salt": salt, "rounds": rounds,
-            "verification_backend": get_hash_backend(),
-        }
-    elif status == "disabled":
-        return {
-            "username": username, "status": "disabled",
-            "algorithm": algo_name,
-            "matched": None, "hash_preview": hash_preview,
-            "severity": "info",
-            "notes": "الحساب معطّل (*).",
-            "salt": salt, "rounds": rounds,
-            "verification_backend": get_hash_backend(),
-        }
-    else:
-        return {
-            "username": username, "status": "unknown",
-            "algorithm": algo_name,
-            "matched": None, "hash_preview": hash_preview,
-            "severity": "medium",
-            "notes": "صيغة تجزئة غير معروفة.",
-            "salt": salt, "rounds": rounds,
-            "verification_backend": get_hash_backend(),
-        }
-
-
-# ===========================================================================
-# واجهة التدقيق الرئيسية
-# ===========================================================================
 
 def audit_linux_shadow(
-    shadow_path: str = "/etc/shadow",
-    passwd_path: str = "/etc/passwd",
-    wordlist_path: str = "wordlists/wordlist.txt",
-    min_uid: int = 1000,
-    skip_system_accounts: bool = True,
-    case_fold: bool = False,
-    strip: bool = True,
-    workers: Optional[int] = None,
-    progress_cb: Optional[Callable[[str, int, int], None]] = None,
-    cancel_event: Optional["mp.Event"] = None,
-    batch_size: int = 4,
-) -> AuditReport:
+    wordlist_path: str | Path = WORDLIST_PATH,
+    progress_callback: Callable[
+        [int, int, str, int, int], None
+    ] | None = None,
+    *,
+    max_candidates: int | None = None,
+    max_duration_seconds: float | None = None,
+    rate_limit: float | None = None,
+    stop_event: threading.Event | None = None,
+    stop_on_first_match: bool = False,
+) -> tuple[list[tuple[str, str, str]], str]:
     """
-    تدقيق كلمات مرور حسابات Linux المحلية.
+    Audit Linux password hashes.
 
-    المعاملات:
-        shadow_path:            مسار /etc/shadow.
-        passwd_path:            مسار /etc/passwd (لاستخراج UID).
-        wordlist_path:          مسار ملف القائمة.
-        min_uid:                الحد الأدنى لـ UID للحسابات غير النظامية.
-        skip_system_accounts:   استثناء حسابات النظام (UID < min_uid).
-        case_fold:              تطبيع الحالة.
-        strip:                  إزالة المسافات.
-        workers:                عدد عمّال multiprocessing.
-        progress_cb:            دالة (msg, done, total) للتقدّم.
-        cancel_event:           mp.Event للإلغاء (اختياري).
-        batch_size:             عدد المستخدمين في كل دفعة عامل (يقلّل قراءة
-                                القائمة: N_batches = ceil(N_users/batch_size)).
+    Limits:
+        max_candidates:
+            Maximum total candidates tested during this audit.
 
-    يعيد AuditReport.
+        max_duration_seconds:
+            Maximum duration for the audit.
 
-    عزل الأخطاء: فشل مستخدم واحد لا يُنهي التدقيق.
-    الإلغاء: إن وُضع cancel_event، يتوقّف التدقيق بأمان.
+        rate_limit:
+            Maximum candidate rate per second.
+
+        stop_event:
+            Event set by the GUI when the user presses Stop.
+
+        stop_on_first_match:
+            Stop the entire audit after the first password match.
     """
-    start = time.time()
 
-    if not os.path.exists(wordlist_path):
-        raise FileNotFoundError(f"ملف القائمة غير موجود: {wordlist_path}")
+    shadow_path = "/etc/shadow"
 
-    # إحصاءات القائمة
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    # Validate optional limits
+    if max_candidates is not None:
+        max_candidates = max(1, int(max_candidates))
+
+    if max_duration_seconds is not None:
+        max_duration_seconds = max(
+            0.1,
+            float(max_duration_seconds),
+        )
+
+    if rate_limit is not None:
+        rate_limit = max(0.1, float(rate_limit))
+
+    # Check access to /etc/shadow
+    if not os.access(shadow_path, os.R_OK):
+        return [], (
+            "Failed: /etc/shadow cannot be read. "
+            "Run the tool with administrator privileges (sudo)."
+        )
+
+    # Load candidates
+    wordlist = load_wordlist_candidates(wordlist_path)
+
+    if not wordlist:
+        return [], "The wordlist is empty."
+
+    # Initialize Passlib for traditional hash schemes
     try:
-        wstats = wordlist_stats(wordlist_path)
-        wl_count = wstats["word_count"]
-    except Exception:
-        wl_count = 0
+        from passlib.context import CryptContext
 
-    # قراءة الظل
-    shadow_entries = _read_shadow(shadow_path)
+        ctx = CryptContext(
+            schemes=[
+                "sha512_crypt",
+                "sha256_crypt",
+                "md5_crypt",
+                "des_crypt",
+            ]
+        )
 
-    # قراءة UIDs
-    uids = _read_passwd_uids(passwd_path) if skip_system_accounts else {}
+    except ImportError:
+        ctx = None
 
-    # تصفية الحسابات
-    active_users: List[tuple] = []
-    skipped_system = 0
-    for username, hash_field, _last in shadow_entries:
-        if skip_system_accounts and username != "root":
-            uid = uids.get(username)
-            if uid is not None and uid < min_uid:
-                skipped_system += 1
+    # Read accounts from /etc/shadow
+    users = []
+
+    with open(
+        shadow_path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+    ) as shadow_file:
+
+        for line in shadow_file:
+            parts = line.strip().split(":")
+
+            if len(parts) < 2:
                 continue
-        active_users.append((username, hash_field))
 
-    # تقسيم المستخدمين إلى دفعات
-    n_users = len(active_users)
-    if n_users == 0:
-        if progress_cb:
-            progress_cb("لا توجد حسابات للفحص.", 0, 0)
-        report = AuditReport()
-        report.source_platform = "linux"
-        report.hostname = socket.gethostname()
-        report.wordlist_path = os.path.abspath(wordlist_path)
-        report.wordlist_count = wl_count
-        report.duration_seconds = time.time() - start
-        report.hash_backend = get_hash_backend()
-        if skipped_system:
-            report.add(Finding(
-                username="(system-accounts)", source="linux-shadow",
-                algorithm="—", status="skipped",
-                severity="info",
-                notes=f"تم استثناء {skipped_system} حساب نظام (UID < {min_uid}).",
-            ))
-        return report
+            username = parts[0]
+            stored_hash = parts[1]
 
-    batches: List[List[tuple]] = []
-    for i in range(0, n_users, batch_size):
-        batches.append(active_users[i: i + batch_size])
+            # Skip locked accounts and accounts without usable hashes
+            if (
+                not stored_hash
+                or stored_hash.startswith("!")
+                or stored_hash.startswith("*")
+                or stored_hash == "x"
+            ):
+                continue
 
-    if progress_cb:
-        progress_cb(f"بدء تدقيق {n_users} حساباً ضدّ قائمة من {wl_count} كلمة "
-                    f"({len(batches)} دفعة، {workers or 'auto'} عمّال).",
-                    0, n_users)
+            users.append((username, stored_hash))
 
-    # علم إلغاء مشترك
-    cancel_flag = None
-    if cancel_event is not None:
-        # نستخدم Value بدلاً من Event لأنّ Event قد لا ينتقل عبر fork بسلاسة
-        # في بعض البيئات؛ لكنّ Event يعمل عادةً. نستخدم Event مباشرة.
-        cancel_flag = cancel_event
+    if not users:
+        return [], "No accounts were found."
 
-    # بناء المهام
-    tasks = [(batch, wordlist_path, case_fold, strip, cancel_flag)
-             for batch in batches]
+    found = []
 
-    n_workers = workers or max(1, mp.cpu_count())
-    n_workers = min(n_workers, len(batches))
+    checked_words = 0
+    unsupported = 0
+    failed_accounts = 0
 
-    results: List[dict] = []
-    cancelled = False
+    started_at = time.perf_counter()
+    last_progress_at = 0.0
+    next_candidate_at = started_at
 
-    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
-    try:
-        with ctx.Pool(processes=n_workers) as pool:
-            done_users = 0
-            for batch_results in pool.imap_unordered(_audit_user_batch, tasks,
-                                                       chunksize=1):
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
+    stop_reason = None
+    current_account_index = 0
+    current_username = ""
+
+    def elapsed_seconds() -> float:
+        return time.perf_counter() - started_at
+
+    def should_stop() -> str | None:
+        """Return a stop reason if a limit has been reached."""
+
+        if stop_event.is_set():
+            return "Stopped by user"
+
+        if (
+            max_candidates is not None
+            and checked_words >= max_candidates
+        ):
+            return "Maximum candidate limit reached"
+
+        if (
+            max_duration_seconds is not None
+            and elapsed_seconds() >= max_duration_seconds
+        ):
+            return "Maximum duration reached"
+
+        return None
+
+    def send_progress(
+        account_index: int,
+        username: str,
+        checked: int,
+        total_candidates: int,
+        force: bool = False,
+    ) -> None:
+        """Send progress updates at a controlled interval."""
+
+        nonlocal last_progress_at
+
+        if progress_callback is None:
+            return
+
+        now = time.perf_counter()
+
+        if force or now - last_progress_at >= 0.35:
+            last_progress_at = now
+
+            progress_callback(
+                account_index,
+                len(users),
+                username,
+                checked,
+                total_candidates,
+            )
+
+    def wait_for_rate_limit() -> bool:
+        """
+        Apply rate limiting without blocking cancellation.
+
+        Returns False if the audit should stop.
+        """
+
+        nonlocal next_candidate_at
+
+        if rate_limit is None:
+            return should_stop() is None
+
+        interval = 1.0 / rate_limit
+        next_candidate_at += interval
+
+        while True:
+            reason = should_stop()
+
+            if reason is not None:
+                return False
+
+            now = time.perf_counter()
+            remaining = next_candidate_at - now
+
+            if remaining <= 0:
+                return True
+
+            # Event.wait allows prompt cancellation during the delay.
+            stop_event.wait(min(remaining, 0.1))
+
+    # Audit each account
+    for account_index, (username, full_hash) in enumerate(
+        users,
+        start=1,
+    ):
+        current_account_index = account_index
+        current_username = username
+
+        matched = None
+        account_candidates_checked = 0
+        verification_error = None
+
+        send_progress(
+            account_index,
+            username,
+            0,
+            len(wordlist),
+            force=True,
+        )
+
+        # Yescrypt hashes
+        if full_hash.startswith("$y$"):
+
+            for candidate_index, word in enumerate(
+                wordlist,
+                start=1,
+            ):
+                stop_reason = should_stop()
+
+                if stop_reason is not None:
                     break
-                results.extend(batch_results)
-                done_users += len(batch_results)
-                if progress_cb:
-                    progress_cb(f"تم فحص {done_users}/{n_users} حساباً.",
-                                done_users, n_users)
-    except Exception as e:
-        # خطأ في Pool — نُسجّله لكن نُكمل بنتائج الجزء المُكتمل
-        if progress_cb:
-            progress_cb(f"خطأ في تجمّع العمّال: {e}", 0, 0)
 
-    # بناء التقرير
-    report = AuditReport()
-    report.source_platform = "linux"
-    report.hostname = socket.gethostname()
-    report.wordlist_path = os.path.abspath(wordlist_path)
-    report.wordlist_count = wl_count
-    report.duration_seconds = time.time() - start
-    report.hash_backend = get_hash_backend()
-    report.metadata["cancelled"] = cancelled
-    report.metadata["batches"] = len(batches)
-    report.metadata["batch_size"] = batch_size
+                if not wait_for_rate_limit():
+                    stop_reason = should_stop() or "Audit stopped"
+                    break
 
-    for r in results:
-        report.add(Finding(
-            username=r["username"],
-            source="linux-shadow",
-            algorithm=r["algorithm"],
-            status=r["status"],
-            matched_password_masked=r["matched"],
-            hash_preview=r["hash_preview"],
-            severity=r["severity"],
-            notes=r["notes"],
-            uid=uids.get(r["username"]),
-            salt=r.get("salt"),
-            rounds=r.get("rounds"),
-            verification_backend=r.get("verification_backend") or get_hash_backend(),
-            audit_source=shadow_path,
-        ))
+                checked_words += 1
+                account_candidates_checked = candidate_index
 
-    # الحسابات النظامية المستثناة
-    if skipped_system:
-        report.findings.append(Finding(
-            username="(system-accounts)",
-            source="linux-shadow",
-            algorithm="—",
-            status="skipped",
-            matched_password_masked=None,
-            hash_preview=None,
-            severity="info",
-            notes=f"تم استثناء {skipped_system} حساب نظام (UID < {min_uid}).",
-        ))
+                try:
+                    if _verify_yescrypt_native(
+                        word,
+                        full_hash,
+                    ):
+                        matched = word
+                        break
 
-    if progress_cb:
-        if cancelled:
-            progress_cb("تم إلغاء التدقيق.", len(results), n_users)
+                except Exception as error:
+                    verification_error = (
+                        "Yescrypt verification failed: "
+                        f"{error}"
+                    )
+                    break
+
+                send_progress(
+                    account_index,
+                    username,
+                    account_candidates_checked,
+                    len(wordlist),
+                )
+
+        # Traditional Linux hash schemes
         else:
-            progress_cb("اكتمل التدقيق.", n_users, n_users)
 
-    return report
+            if ctx is None:
+                unsupported += 1
 
+                found.append(
+                    (
+                        username,
+                        "Unsupported",
+                        "Passlib is unavailable",
+                    )
+                )
 
-# الحفاظ على الـ worker القديم للاستدعاءات المباشرة (للتوافق الخلفي)
-def _audit_one_user(args: tuple) -> dict:
-    """
-    [مُهمل — للتوافق الخلفي] فحص مستخدم واحد.
-    مُحافَظ عليها لتفادي كسر الاستدعاءات المباشرة، لكنّ audit_linux_shadow
-    يستخدم الآن _audit_user_batch (أكثر كفاءة).
-    """
-    username, hash_field, wordlist_path, case_fold, strip = args
-    batch_results = _audit_user_batch(
-        [(username, hash_field)], wordlist_path, case_fold, strip, None)
-    return batch_results[0] if batch_results else {
-        "username": username, "status": "error", "algorithm": "",
-        "matched": None, "hash_preview": "", "severity": "medium",
-        "notes": "لم تُنتج الدفعة نتيجة.",
-    }
+                send_progress(
+                    account_index,
+                    username,
+                    0,
+                    len(wordlist),
+                    force=True,
+                )
 
+                continue
 
-__all__ = ["audit_linux_shadow"]
+            for candidate_index, word in enumerate(
+                wordlist,
+                start=1,
+            ):
+                stop_reason = should_stop()
+
+                if stop_reason is not None:
+                    break
+
+                if not wait_for_rate_limit():
+                    stop_reason = should_stop() or "Audit stopped"
+                    break
+
+                checked_words += 1
+                account_candidates_checked = candidate_index
+
+                try:
+                    if ctx.verify(
+                        word,
+                        full_hash,
+                    ):
+                        matched = word
+                        break
+
+                except Exception as error:
+                    verification_error = (
+                        "Password hash verification failed: "
+                        f"{error}"
+                    )
+                    break
+
+                send_progress(
+                    account_index,
+                    username,
+                    account_candidates_checked,
+                    len(wordlist),
+                )
+
+        # Record account result
+        if verification_error is not None:
+
+            failed_accounts += 1
+
+            found.append(
+                (
+                    username,
+                    "Error",
+                    verification_error,
+                )
+            )
+
+        elif matched is not None:
+
+            found.append(
+                (
+                    username,
+                    "Weak",
+                    mask_password(matched),
+                )
+            )
+
+            if stop_on_first_match:
+                stop_reason = "Stopped after first match"
+
+        elif stop_reason is not None:
+
+            found.append(
+                (
+                    username,
+                    "Stopped",
+                    stop_reason,
+                )
+            )
+
+        else:
+
+            found.append(
+                (
+                    username,
+                    "Not in the list",
+                    "No match",
+                )
+            )
+
+        send_progress(
+            account_index,
+            username,
+            account_candidates_checked,
+            len(wordlist),
+            force=True,
+        )
+
+        # Stop the entire audit if requested or limited
+        if stop_reason is not None:
+            break
+
+    # Mark accounts that were not audited
+    if stop_reason is not None:
+        completed_usernames = {
+            username
+            for username, _, _ in found
+        }
+
+        for username, _ in users:
+            if username not in completed_usernames:
+                found.append(
+                    (
+                        username,
+                        "Not audited",
+                        stop_reason,
+                    )
+                )
+
+    elapsed = elapsed_seconds()
+
+    successfully_processed = (
+        len(users)
+        - unsupported
+        - failed_accounts
+    )
+
+    if stop_reason is not None:
+        summary = (
+            f"Audit stopped: {stop_reason}. "
+            f"Processed {successfully_processed} accounts, "
+            f"{unsupported} unsupported, "
+            f"{failed_accounts} failed. "
+            f"Tested {checked_words:,} candidates "
+            f"in {elapsed:.1f} seconds."
+        )
+
+    else:
+        summary = (
+            f"Processed {successfully_processed} accounts, "
+            f"{unsupported} unsupported, "
+            f"{failed_accounts} failed. "
+            f"Tested {checked_words:,} candidates "
+            f"in {elapsed:.1f} seconds."
+        )
+
+    return found, summary

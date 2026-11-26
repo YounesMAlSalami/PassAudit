@@ -1,10 +1,8 @@
-# Core dependencies
-passlib==1.7.4
-bcrypt>=4.0,<5.0
-zxcvbn>=4.4.28,<5.0
-pycryptodome>=3.19.0
-yescrypt>=1.0.1,<2.0
+# Python dependencies. tkinter is provided by the OS package manager.
+pycryptodome>=3.20
+pypykatz>=0.6
+passlib>=1.7
+zxcvbn>=4.4
+yescrypt>=1.0
+pytest>=8.0
 
-# Vetted Windows-only/offline analysis dependencies
-impacket>=0.13.1
-pypykatz>=0.6.13

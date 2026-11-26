@@ -1,371 +1,361 @@
-# PassGuard — أداة تدقيق وفحص سلامة كلمات المرور
+# PassGuard Password Auditor
 
-## Implementation Status
+PassGuard is a local Tkinter application for password checks, password generation, local account-password auditing, and sanitized audit reports. It uses a local wordlist and local operating-system data; it does not use a remote API or cloud service.
 
-- The core password checker and NTLM synthetic verification are implemented.
-- Linux shadow auditing requires a Linux host and real controlled accounts; it is
-  integration-gated and is not reported as verified on Windows.
-- Windows live SAM extraction is currently limited to the legacy custom
-  RC4/DES path and is not validated on an actual Windows SAM hive.
-- Modern or unsupported SAM formats must be reported as unsupported, not
-  silently passed through legacy decryption.
-- The GUI has been migrated to PySide6. Tkinter code remains in
-  `passguard/gui_tkinter_legacy.py` only for reference and is not loaded.
+Use PassGuard only on systems and accounts you own or are explicitly authorized to audit.
 
-> أداة دفاعية (Blue Team / SOC) بواجهة رسومية موحّدة لتدقيق كلمات مرور
-> الحسابات المحلية في **Linux** و**Windows**، مع محلّل لحظي لقوة كلمات
-> المرور (إنتروبيا + قابلية تخمين + كشف أنماط)، مولّد كلمات مرور قوية،
-> **قراءة مباشرة من SAM** (بمكتبات Microsoft القياسية)، محرّك تقييم مخاطر
-> مركزي، مُقيِّم سياسات كلمات المرور، وسجلّ تدقيقات تاريخي (SQLite).
+## Features
 
-**الإصدار:** 3.1.0
+- Check a password against the default local wordlist and estimate its strength.
+- Generate passwords with configurable length and character categories using Python's `secrets` module.
+- Audit Linux `/etc/shadow` entries with passlib or yescrypt verification.
+- Audit local Windows SAM entries using exported registry hives and `pypykatz`.
+- Export sanitized audit reports as HTML, JSON, or CSV.
+- Store reports locally in SQLite and reopen, re-export, or delete them.
+- Run an interactive Linux, Windows, or candidate-check menu through the CLI.
 
----
+## Screenshots
 
-## جدول المحتويات
+### Kali Linux
 
-1. [نظرة عامة](#نظرة-عامة)
-2. [التشغيل السريع](#التشغيل-السريع)
-3. [بنية المشروع](#بنية-المشروع)
-4. [الواجهة الرسومية](#الواجهة-الرسومية)
-5. [أوامر سطر الأوامر (CLI)](#أوامر-سطر-الأوامر-cli)
-6. [تحليل كلمات المرور](#تحليل-كلمات-المرور)
-7. [تقييم المخاطر والسياسات](#تقييم-المخاطر-والسياسات)
-8. [سجلّ التدقيقات](#سجلّ-التدقيقات)
-9. [الاعتبارات الأمنية](#الاعتبارات-الأمنية)
-10. [المتطلّبات والتثبيت](#المتطلبات-والتثبيت)
-11. [الحدود والملاحظات الصريحة](#الحدود-والملاحظات-الصريحة)
-12. [إخلاء المسؤولية والتصريح](#إخلاء-المسؤولية-والتصريح)
+![PassGuard on Kali Linux](<Assets/kali/‏‏لقطة الشاشة (166).png>)
 
----
+### Windows
 
-## نظرة عامة
+![PassGuard on Windows](<Assets/windows/‏‏لقطة الشاشة (184).png>)
 
-PassGuard أداة Python خالصة بواجهة رسومية (tkinter) تجمع وظائف أمنية
-دفاعية متعدّدة:
+## Supported Platforms and Audits
 
-1. **🔑 فاحص كلمات المرور** — إدخال كلمة مرور (مُخفّى) وفحصها لحظياً ضدّ
-   قائمة التسريبات الشائعة، مع عرض:
-   - **الإنتروبيا النظرية** (bits) — حدّ أعلى رياضي، ليست تخميناً فعلياً.
-   - **قابلية التخمين** (guessability): تافته / منخفضة / متوسطة / عالية / عالية جداً.
-   - **خطر الأنماط** (pattern_risk): كشف 10 أنواع (تكرار، تسلسل، لوحة مفاتيح،
-     بادئات/لواحق شائعة، سنوات، تواريخ، مقاطع مكرّرة، هياكل شائعة).
-   - **التعرّض للقاموس** (dictionary_exposure): مكشوفة / غير مكشوفة / لم يُفحص.
-   - **مقاومة التخمين** (guess_resistance): ملخّص تفسيري.
-   - قائمة تحقّق بصرية واقتراحات تحسين.
-   - تكامل اختياري مع **zxcvbn** لتحليل قابلية تخمين متقدّم.
+| Capability | Supported implementation |
+|---|---|
+| Password check and strength estimate | All systems supported by the Tkinter application |
+| Password generation | All systems supported by the Tkinter application |
+| Linux account audit | Local Linux hosts with read access to `/etc/shadow` |
+| Windows account audit | Local Windows hosts with elevated registry access |
 
-2. **🛡️ تدقيق الحسابات** — فحص كلمات مرور الحسابات المحلية:
-   - **Linux**: قراءة تلقائية من `/etc/shadow` و`/etc/passwd` (يتطلّب sudo).
-   - **Windows**: تحديد ملف تجزئات NTLM (مُستخرَج مسبقاً عبر secretsdump).
-   - تصنيف واضح: ضعيفة / لم تُطابق / مقفلة / معطّلة / فارغة / غير معروفة /
-     خطأ / غير مُقيَّمة. **عدم التطابق لا يعني الأمان.**
+The Linux auditor verifies:
 
-3. **🎲 مولّد كلمات المرور** — توليد آمن تشفيرياً (secrets) مع خيارات
-   الأصناف، أو عبارات مرور (passphrase) بأسلوب Diceware مع دعم قوائم
-   خارجية وحساب إنتروبيا فعلي.
+- SHA-512 crypt (`$6$`)
+- SHA-256 crypt (`$5$`)
+- MD5 crypt (`$1$`)
+- Traditional DES crypt
+- Yescrypt (`$y$`) when the `yescrypt` package is installed
 
-4. **📊 مُقيِّم السياسات** — تقييم سياسات كلمات المرور من /etc/login.defs
-   وPAM (Linux) أو تصدير LSP/AD (Windows)، مع تتبّع المصدر لكل تقييم.
+The Linux passlib context does not include bcrypt. The password utility can identify bcrypt and traditional DES formats, but the Linux audit verifier does not include bcrypt and must report it as unsupported.
 
-5. **⚠️ محرّك تقييم المخاطر** — تجميع مركزي للنتائج من كل المصادر في
-   findings موحّدة (severity, confidence, category, remediation).
+The Windows auditor:
 
-6. **🗄️ سجلّ التدقيقات** — تخزين بيانات وصفية في SQLite مع دعم المقارنة
-   بين التدقيقات (لا كلمات مرور صريحة أو تجزئات كاملة).
+- Runs only when `sys.platform == "win32"`.
+- Exports the `HKLM\SAM` and `HKLM\SYSTEM` hives with `reg save`.
+- Parses local users and NT hashes with `pypykatz`.
+- Validates NT hashes as 32-character hexadecimal values.
+- Computes candidate NTLM hashes from UTF-16-LE password bytes using PyCryptodome MD4.
 
-كل كلمات المرور المطابقة تُعرض **مُخفّاة** (`p*******`) في كل التقارير
-والسجلّ. لا تُسجَّل كلمة المرور المدخلة في الفاحص في أيّ ملف أو سجل.
+The application does not provide an arbitrary hash-file import workflow. It obtains Windows NT hashes only through local SAM extraction.
 
----
+## GUI
 
-## التشغيل السريع
+The GUI entry point creates a 1180×780 Tkinter window with four pages:
+
+1. **Dashboard** - Enter a password to check it against the loaded wordlist and view a strength score, character categories, estimated character pool, estimated search space, and recommendations.
+2. **Account Audit** - Select a Linux or Windows audit, view progress and account results, inspect masked hash details, and export an active report.
+3. **Password Generator** - Select a length and character categories, generate a password using `secrets`, show or hide it, copy it, or clear it.
+4. **Reports** - View report metrics and account details, open or delete SQLite history entries, and export or re-export reports.
+
+The GUI also reloads the wordlist from `wordlists/wordlist.txt` when **Reload Wordlist** is selected.
+
+## Wordlist Processing
+
+The default file is [wordlists/wordlist.txt](wordlists/wordlist.txt). It contains about 99,840 non-empty candidate lines. The application:
+
+- Reads the file with UTF-8-sig encoding.
+- Removes leading and trailing whitespace.
+- Ignores empty lines.
+- Normalizes candidates with `casefold()` for membership checks.
+- Reloads the file from disk without restarting the application.
+
+A wordlist match is evidence that the supplied candidate appeared in this local list. A non-match does not prove that a password is strong or uncompromised.
+
+## Strength and Generation
+
+Password strength uses `zxcvbn` when it is available. If import or scoring fails, the application uses a local fallback based on password length, character diversity, and repeated characters.
+
+The score is shown as 0–100 and is mapped to:
+
+- Very Weak
+- Weak
+- Moderate
+- Strong
+- Very Strong
+
+Generated passwords ensure that each selected character category appears at least once when the requested length can accommodate it. The generator rejects lengths below 4 characters, configurations with no character category, and lengths that are too short for every selected category.
+
+These results are estimates, not guarantees of password security.
+
+## Reports and Audit History
+
+The GUI reports audit date, operating system, audit type, account totals, weak matches, non-matches, unsupported hashes, errors, and elapsed duration.
+
+Exports are available through Save File dialogs in:
+
+- HTML (`.html`)
+- JSON (`.json`)
+- CSV (`.csv`)
+
+Exports contain report metadata, account hash metadata, masked hash previews, errors, and recommendations. Plaintext passwords and complete hash values are excluded.
+
+The GUI full-hash display is protected by platform privilege checks and confirmation. On Linux, it requires root. On Windows, it requires elevation. Full hashes are never added to exports or SQLite history.
+
+The GUI stores sanitized report history in `reports/audit_history.sqlite3`. Its report history supports:
+
+- Opening a previous report
+- Re-exporting a previous report
+- Deleting a history entry
+- Recording selected export paths
+
+If report history or export storage fails, the application reports the failure. A report that cannot be saved to SQLite is available only for the current session when otherwise possible.
+
+## Requirements
+
+- Python 3.10 or newer for the source syntax currently used
+- Tkinter/Tcl-Tk provided by the operating system
+- [requirements.txt](requirements.txt):
+  - `pycryptodome>=3.20`
+  - `pypykatz>=0.6`
+  - `passlib>=1.7`
+  - `zxcvbn>=4.4`
+  - `yescrypt>=1.0`
+  - `pytest>=8.0`
+
+Pytest is used for tests and is not required to launch the application.
+
+## Download the Repository
+
+The repository remote is:
+
+```text
+https://github.com/YounesMAlSalami/PassAudit.git
+```
+
+### Clone with Git
 
 ```bash
-# 1) تثبيت المتطلّبات (passlib اختياري لكن مُوصى به):
-pip install -r requirements.txt
-
-# 2) إطلاق الواجهة الرسومية (الافتراضي):
-python3 main.py
-
-# 3) أو بتحديد ملف قائمة مختلف:
-python3 main.py --wordlist /path/to/your_wordlist.txt
+git clone https://github.com/YounesMAlSalami/PassAudit.git
+cd PassAudit
 ```
 
-على Linux لتدقيق الحسابات المحلية، شغّل بـ sudo:
-```bash
-sudo python3 main.py
-# ثمّ انتقل لتبويب "تدقيق الحسابات" واضغط "بدء تدقيق Linux"
+Your local directory name may differ if you clone into a custom destination.
+
+### Download a ZIP
+
+1. Open <https://github.com/YounesMAlSalami/PassAudit>.
+2. Click **Code**.
+3. Select **Download ZIP**.
+4. Extract the archive.
+5. Open PowerShell or a terminal in the extracted project directory.
+
+## Windows Installation
+
+The setup below uses a virtual environment and PowerShell.
+
+1. Install Python 3.10 or newer and verify `py` is available.
+2. Clone or extract the repository.
+3. Open PowerShell in the project directory.
+4. Create and activate a virtual environment:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
----
+Tkinter should be included with the standard Python installation on typical Windows distributions. If `tkinter` is missing, repair or reinstall Python with the Tk/Tcl feature included.
 
-## بنية المشروع
+If PowerShell prevents activation:
 
-```
-passguard/
-├── main.py                          # نقطة الدخول (GUI افتراضياً + أوامر CLI)
-├── requirements.txt                 # المتطلّبات (passlib/zxcvbn اختياريان)
-├── README.md                        # هذا الملف
-│
-├── passguard/                       # الحزمة
-│   ├── __init__.py                  # تصدير الواجهة العامة
-│   ├── hash_utils.py                # NTLM + MD4 + backend تجزئة Unix (passlib/crypt/unsupported)
-│   ├── wordlist_loader.py           # تحميل القوائم بكفاءة (set + generator)
-│   ├── wordlist_manager.py          # إدارة قوائم متعددة + بيانات وصفية + تكامل SHA-256
-│   ├── reporter.py                  # تقارير JSON/CSV/HTML غنية + تصنيف النتائج
-│   ├── linux_auditor.py             # تدقيق /etc/shadow (دفعات، إلغاء، عزل أخطاء)
-│   ├── windows_auditor.py           # تدقيق NTLM (جدول بحث + تحقّق إدخال + SAM مباشر)
-│   ├── sam_reader.py                # قراءة SAM مباشرة (RegSaveKeyEx + RC4/DES + hive parser)
-│   ├── password_analyzer.py         # إنتروبيا + أنماط + guessability + zxcvbn اختياري
-│   ├── password_generator.py        # مولّد كلمات + passphrase Diceware
-│   ├── password_policy_auditor.py   # تقييم سياسات (PAM/login.defs/LSP/AD)
-│   ├── risk_engine.py               # تقييم مخاطر مركزي (findings + severity + confidence)
-│   ├── audit_history.py             # سجلّ تدقيقات SQLite + مقارنة
-│   └── gui.py                       # الواجهة الرسومية بثلاثة تبويبات
-│
-└── wordlists/
-    └── wordlist.txt                 # قائمة عينة
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-### أين يُستخدم كل ملف؟
+This changes policy only for the current PowerShell process.
 
-| الملف | الغرض |
-|-------|-------|
-| `passguard/hash_utils.py` | دوال التجزئة الأساسية (NTLM، MD4، تحليل ظل Unix) |
-| `passguard/wordlist_loader.py` | تحميل القوائم بكفاءة في set أو generator |
-| `passguard/password_analyzer.py` | حساب الإنتروبيا، وقت الكسر، احتمال الاختراق، قائمة التحقّق |
-| `passguard/password_generator.py` | توليد كلمات مرور عشوائية آمنة تشفيرياً |
-| `passguard/linux_auditor.py` | تدقيق /etc/shadow تلقائياً (مع توازي) |
-| `passguard/windows_auditor.py` | تدقيق ملف تجزئات NTLM (جدول بحث O(1)) |
-| `passguard/reporter.py` | بنية التقارير (JSON/CSV/HTML مع إخفاء كلمات المرور) |
-| `passguard/gui.py` | الواجهة الرسومية الموحّدة (التبويبات الثلاثة) |
-| `main.py` | نقطة الدخول — تشغّل GUI افتراضياً، أو أمر CLI محدّد |
+Windows account auditing requires an elevated PowerShell or application session and working access to the local SAM and SYSTEM hives. SAM support can vary with Windows configuration, registry policy, and `pypykatz` compatibility.
 
----
+## Linux — Kali / Debian / Ubuntu
 
-## الواجهة الرسومية
-
-عند تشغيل `python3 main.py` تفتح نافذة بثلاثة تبويبات:
-
-### التبويب 1: 🔑 فاحص كلمات المرور
-
-- **حقل إدخال مُخفّى** (Masked) مع زر إظهار/إخفاء.
-- **فحص لحظي** أثناء الكتابة (debounce 180ms).
-- **شريط قوة لوني** يتدرّج من الأحمر (ضعيفة جداً) إلى الأخضر (ممتازة).
-- **شبكة مقاييس**:
-  - الإنتروبيا (bits) = L × log2(N)
-  - وقت الكسر التقديري (بافتراض 10¹⁰ تخمين/ثانية لهجوم offline على NTLM)
-  - احتمال الاختراق (%) — 100% إن كانت في القائمة
-  - عدد التركيبات الممكنة = N^L
-- **قائمة تحقّق بصرية** (10 عناصر): 12+ حرفاً، أصناف الأحرف الأربعة،
-  ليست في القائمة، لا تكرارات/تسلسلات/أنماط لوحة مفاتيح/سنوات.
-- **بانر حالة التسريب**: "✅ لم تُعثر عليها" أو "⚠️ مُدرجة في القائمة".
-- **صندوق اقتراحات** تحسين ديناميكي.
-- زر **🎲 توليد** سريع لكلمة قوية.
-
-### التبويب 2: 🛡️ تدقيق الحسابات
-
-- **قسم Linux**:
-  - يعرض حالة الصلاحية تلقائياً (✅ متاحة / ⚠️ يتطلّب sudo).
-  - زر "بدء تدقيق Linux" — يقرأ من `/etc/shadow` و`/etc/passwd` تلقائياً.
-  - يستثني حسابات النظام (UID < 1000) افتراضياً.
-
-- **قسم Windows**:
-  - تعليمات واضحة لاستخراج SAM:
-    `secretsdump.py -sam SAM -system SYSTEM LOCAL > hashes.txt`
-  - زر **استعراض** لاختيار ملف التجزئات.
-  - زر "بدء تدقيق Windows".
-  - يدعم صيغ: pwdump، `user:NT`، `LM:NT`، NT وحدها.
-
-- **جدول النتائج** (Treeview) بأعمدة: المستخدم، المصدر، الخوارزمية، الحالة،
-  كلمة المرور المطابقة (مُخفّاة)، الخطورة. مع تلوين الصفوف حسب الخطورة.
-- **أزرار تصدير**: JSON / HTML / CSV (تُحفظ بكلمات مرور مُخفّاة).
-- التدقيق يجري في **خيط منفصل** (لعدم تجميد الواجهة) مع اتصال آمن
-  للخيوط عبر قائمة (queue) لتفادي أخطاء tkinter التزامنية.
-
-### التبويب 3: 🎲 مولّد كلمات المرور
-
-- **شريط تمرير** للطول (8-64) + Spinbox.
-- **خيارات الأصناف**: كبيرة، صغيرة، أرقام، رموز.
-- خيار **استبعاد الأحرف الملتبسة** (O/0, l/1/I).
-- زر **توليد كلمة مرور** + زر **توليد عبارة مرور** (passphrase).
-- عرض الكلمة المُولّدة + قوتها الفورية + زر **نسخ** + زر **استخدم في الفاحص**.
-- المولّد يستخدم `secrets` (آمن تشفيرياً، لا `random`).
-
----
-
-## أوامر سطر الأوامر (CLI)
-
-للمستخدمين المتقدّمين أو السكربتات الآلية:
+Install Python, Tkinter, and virtual-environment support, then install the project dependencies:
 
 ```bash
-# فحص كلمة مرور واحدة تفاعلياً (إدخال مُخفّى):
-python3 main.py check --wordlist wordlists/wordlist.txt
-
-# توليد كلمة مرور قوية:
-python3 main.py generate --length 20
-python3 main.py generate --passphrase
-
-# تدقيق Linux (يتطلب sudo، يقرأ /etc/shadow تلقائياً):
-sudo python3 main.py audit-linux --out reports/
-
-# تدقيق Windows (مع ملف تجزئات):
-python3 main.py audit-windows --hashes hashes.txt --out reports/
-
-# إحصائيات القائمة:
-python3 main.py wordlist-stats --wordlist wordlists/wordlist.txt
-```
-
-**أكواد الخروج** لأوامر التدقيق:
-- `0` — لا كلمات ضعيفة.
-- `1` — وُجدت كلمات ضعيفة.
-- `2` — خطأ صلاحية (Linux).
-- `3` — خطأ غير متوقّع.
-
----
-
-## قراءة SAM المباشرة (v3.1.0 الجديدة)
-
-تدعم الأداة الآن قراءة تجزئات NTLM مباشرة من قاعدة SAM في Windows باستخدام
-**مكتبات Microsoft القياسية** (لا أدوات خارجية ولا تجاوز للضوابط الأمنية).
-
-### المنهجية المُصرّح بها
-
-1. **تمكين SE_BACKUP_PRIVILEGE** عبر `advapi32` (مكتبة Microsoft القياسية).
-2. **تصدير خليتي SAM وSYSTEM** عبر `RegSaveKeyEx` (واجهة Microsoft موثّقة في Win32 API).
-3. **تحليل ملفات الخلايا** المُصدَّرة (regf format) بـ Python خالص.
-4. **استخراج boot key** من SYSTEM و**NTLM hashes** من SAM.
-5. **فكّ التشفير** (RC4 + DES) بـ Python خالص وفق الخوارزميات الموثّقة.
-
-### المتطلبات
-
-- تشغيل على **Windows** بصلاحيات **Administrator** (أو SYSTEM).
-- لا تتجاوز الأداة ضوابط Windows — تستخدم واجهات Microsoft الموثّقة فقط.
-- القراءة **offline** بعد تصدير الخلية (لا تُعدّل النظام الحيّ).
-
-### الاستخدام
-
-**GUI:** زر «🔑 قراءة SAM مباشرة» في تبويب تدقيق الحسابات (قسم Windows).
-
-**CLI:**
-```bash
-# قراءة مباشرة (Windows + admin):
-python main.py audit-windows-sam --wordlist wordlists/wordlist.txt
-
-# أو من ملفات خلايا مُصدَّرة مسبقاً (أيّ منصة):
-python main.py audit-windows-sam --sam sam.save --system system.save
-```
-
-**Python API:**
-```python
-from passguard import read_sam_hashes, read_sam_hashes_from_files
-
-# قراءة مباشرة (Windows + admin):
-hashes = read_sam_hashes()
-
-# من ملفات مُصدَّرة:
-hashes = read_sam_hashes_from_files("sam.save", "system.save")
-# → [{"username": "Admin", "rid": 500, "lm": "...", "nt": "..."}, ...]
-```
-
-### التحقّق التقني
-
-- **RC4:** مُتحقَّق بمتجهات RFC 6229 المعروفة (Key/Plaintext → BBF316E8D940AF0AD3).
-- **DES:** مُتحقَّق بمتجه FIPS 46-3 القياسي (133457799BBCDFF1 → 85E813540F0AB405).
-- **Hive parser:** مُختبَر بخلية اصطناعية حقيقية (regf format).
-- **44 اختباراً** كلها تنجح (انظر `scripts/test_sam_reader.py`).
-
----
-
-## الاعتبارات الأمنية
-
-1. **لا تُسجَّل كلمات المرور:** لا في stdout، ولا في ملفات السجل، ولا في
-   التقارير. كل كلمة مرور مطابقة تُعرض مُخفّاة عبر `mask_password()`.
-
-2. **مقارنة ثابتة الزمن:** استخدام `hmac.compare_digest` لتجنّب هجمات التوقيت.
-
-3. **offline بالكامل:** لا اتصال شبكي، لا إرسال بيانات لأي خدمة خارجية.
-
-4. **توليد آمن تشفيرياً:** مولّد كلمات المرور يستخدم `secrets` لا `random`.
-
-5. **توازي آمن:** تدقيق Linux يستخدم `multiprocessing` (كل حساب في عملية
-   مستقلة)، والتواصل مع الواجهة عبر قائمة آمنة للخيوط (لا `root.after`
-   من خيط غير رئيسي).
-
-6. **فصل صلاحيات SAM:** الأداة لا تحاول قراءة SAM حيّاً (مقفل من قبل
-   النظام). تُفحّص التجزئات المُستخرجة بأدوات معتمدة.
-
----
-
-## المتطلّبات والتثبيت
-
-### المتطلّبات
-
-- **Python 3.10+** (مُختبَر على 3.12).
-- **tkinter** — مُضمّن عادةً في تثبيت Python على Linux. على Debian/Ubuntu:
-  ```bash
-  sudo apt install python3-tk
-  ```
-- **passlib** (اختياري لكن مُوصى به): لتجزئة NTLM مُختبَرة.
-  ```bash
-  pip install -r requirements.txt
-  ```
-  بدون passlib، تستخدم الأداة تنفيذ MD4 بـ Python خالصة (مُختبَر ضدّ
-  متجهات RFC 1320 الرسمية).
-
-### التثبيت
-
-```bash
-# 1. انسخ مجلد passguard إلى الموقع المطلوب.
-# 2. (اختياري) بيئة افتراضية:
+sudo apt update
+sudo apt install -y python3-full python3-venv python3-tk
 python3 -m venv .venv
 source .venv/bin/activate
-# 3. المتطلّبات:
-pip install -r requirements.txt
-# 4. إطلاق الواجهة:
-python3 main.py
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
----
+Do not use `sudo pip` or force system-package overrides.
 
-## الحدود والملاحظات الصريحة
+The Linux audit reads `/etc/shadow` directly. A normal user normally cannot read that file, and the application does not alter its permissions or automatically elevate itself. Start it through an approved elevated session when necessary:
 
-1. **تدقيق Linux يتطلب `sudo`** لأنّ `/etc/shadow` غير قابل للقراءة
-   للمستخدم العادي. الواجهة تكشف غياب الصلاحية وتُظهر رسالة واضحة.
+```bash
+sudo -E .venv/bin/python main.py
+```
 
-2. **استخراج SAM منفصل:** الأداة لا تقرأ SAM حيّاً (مقفل). استخرج التجزئات
-   أولاً بأداة معتمدة مثل `secretsdump.py` من impacket، ثمّ حدّد الملف
-   في تبويب تدقيق الحسابات.
+For an interactive CLI session with the same privileges:
 
-3. **قوة الفحص تعتمد على جودة القائمة.** القائمة العينة (~155 كلمة)
-   للعرض. في الإنتاج استبدلها بقائمة تسريبات حقيقية (SecLists / Rockyou /
-   HIBP). كلما كبرت وأحدثت، زادت قدرة الأداة على الكشف.
+```bash
+sudo -E .venv/bin/python main.py --cli
+```
 
-4. **وقت الكسر تقدير تحفّظي** يفترض هجوم offline على NTLM (10¹⁰
-   تخمين/ثانية). تجزئات Unix الحديثة (bcrypt/argon2/yescrypt) أبطأ بملايين
-   المرّات، فيكون الوقت الفعلي أطول بكثير.
+Do not change `/etc/shadow` permissions to enable an audit.
 
-5. **تدقيق Linux أبطأ من Windows** لأنّ تجزئات Unix مملّحة (salt مختلف
-   لكل مستخدم). كل مستخدم يُفحص بالتوازي عبر `multiprocessing`. لقوائم
-   كبيرة (ملايين الكلمات)، قد يستغرق تدقيق مستخدم واحد عدة دقائق.
+## Running the GUI
 
-6. **وحدة `crypt` مُهملة في Python 3.12** وتُزال في 3.13. استخدم Python 3.12
-   حالياً. للترقية إلى 3.13+، استبدل `crypt.crypt` بـ `passlib`.
+Run the GUI from the project root after activating the virtual environment.
 
----
+### Windows
 
-## إخلاء المسؤولية والتصريح
+```powershell
+python main.py
+```
 
-**هذه الأداة مُصمّمة للأمن الدفاعي (Blue Team) وتدقيق الحسابات المحلية
-ضمن مؤسسة لديها تصريح صريح بذلك.**
+#### Windows - Run GUI as Administrator
 
-- استخدمها فقط على الأنظمة التي تملك المؤسسة صلاحية قانونية لتدقيقها.
-- لا تستخدمها على أنظمة لا تملك تصريحاً لها — ذلك قد يُخالف قوانين
-  الخصوصية وقوانين مكافحة الجرائم الإلكترونية في بلدك.
-- التقارير تكشف أسماء المستخدمين الضعفاء — عاملها كبيانات حساسة.
-- المؤلف غير مسؤول عن أي استخدام غير مُصرّح به.
+Use an elevated PowerShell window when you need to perform the Windows account audit and access the local SAM and SYSTEM hives.
 
----
+1. Open the Start menu.
+2. Search for **PowerShell**.
+3. Right-click **Windows PowerShell** or **PowerShell**.
+4. Select **Run as administrator**.
+5. Confirm the UAC prompt.
+6. Navigate to the actual PassGuard project directory.
+7. Activate the existing virtual environment.
+8. Launch the GUI from the same elevated window.
 
-**الإصدار:** 2.0.0 · **اللغة:** Python 3.10+ · **الواجهة:** tkinter
+Replace `C:\Path\To\PassGuard` below with the location where you cloned or extracted the project:
+
+```powershell
+cd "C:\Path\To\PassGuard"
+.\.venv\Scripts\Activate.ps1
+python main.py
+OR 
+.\.venv\Scripts\python.exe main.py
+```
+
+If the virtual environment has not been created or the dependencies have not been installed, complete the [Windows Installation](#windows-installation) section first.
+
+Running the GUI through elevated PowerShell allows the Windows account-audit workflow to request administrative access to the local SAM and SYSTEM hives. Elevation does not guarantee that the audit will succeed; registry policy, Windows configuration, and parser compatibility may still prevent it from completing.
+
+For password checking and password generation, a normal non-elevated PowerShell window is sufficient.
+
+### Linux
+
+```bash
+python main.py
+```
+
+#### Linux - Run GUI with `sudo`
+
+Run the GUI with elevated privileges from the project root when you need to audit local Linux accounts and read `/etc/shadow`:
+
+```bash
+sudo -E .venv/bin/python main.py
+```
+
+The virtual environment must already exist and contain the project dependencies. If it has not been created or the dependencies have not been installed, complete the [Linux - Kali / Debian / Ubuntu](#linux--kali--debian--ubuntu) section first.
+
+PassGuard does not change `/etc/shadow` permissions or request privilege escalation internally. The GUI can be launched without `sudo` for password checking and password generation, but the Linux account-audit workflow will fail with a permissions error if `/etc/shadow` is not readable.
+
+The application does not need to be installed as a system package.
+
+### GUI Troubleshooting
+
+- `No module named tkinter`: install Tkinter with your operating system package manager. On Debian or Kali, use `python3-tk`.
+- `No module named ...`: activate the virtual environment and rerun `python -m pip install -r requirements.txt`.
+- Linux audit permission error: `/etc/shadow` is not readable by the current process.
+- Windows audit cannot export or parse SAM: run in an elevated session and verify local SAM/SYSTEM access.
+- Reports cannot be created or saved: verify write permission for the project `reports` directory and the selected export location.
+
+## Running the CLI
+
+Start the interactive menu from the project root:
+
+```bash
+python main.py --cli
+```
+
+The menu provides:
+
+1. **Audit Linux Passwords (/etc/shadow)** - available only on Linux. The process must be able to read `/etc/shadow`.
+2. **Audit Windows Accounts (SAM)** - available only on Windows. The process must be elevated and able to export and parse the SAM and SYSTEM hives.
+3. **Check a Candidate Password** - prompts securely for a password and compares it with the default wordlist. It does not display or perform strength analysis in this menu.
+4. **Exit**
+
+The CLI Linux audit prints account state and masked matched-candidate details. The CLI candidate check does not accept a password on the command line and does not save audit reports.
+
+The CLI does not accept:
+
+- Arbitrary hash-file paths
+- Arbitrary wordlist paths
+- Export format arguments
+- Separate audit subcommands
+
+## Tests
+
+Run the test suite from the project root:
+
+```bash
+python -m pytest tests -v
+```
+
+The tests cover password strength categories, password generation, wordlist lookup, Linux hash detection, report redaction and HTML/JSON/CSV export, NT hash validation, and SQLite history round-trips.
+
+These tests do not replace live `/etc/shadow` or Windows SAM integration tests.
+
+## Project Structure
+
+```text
+main.py                 GUI and CLI entry point
+password_auditor.py     Compatibility export facade
+passguard/
+  __init__.py
+  audit_history.py      SQLite report-history store
+  cli.py                Interactive CLI menu
+  config.py             Project and report paths
+  gui.py                Tkinter interface
+  linux_auditor.py      /etc/shadow wordlist verification
+  password_utils.py     Strength, generation, and masking helpers
+  reporting.py          Sanitized report model and exporters
+  windows_auditor.py    SAM hive extraction and NTLM verification
+  wordlist.py           Wordlist loading and lookup
+wordlists/
+  wordlist.txt          Default candidate list
+tests/
+  test_assignment4.py
+  test_reports.py
+Assets/
+  kali/                 Kali interface screenshots
+  windows/              Windows interface screenshots
+LICENSE
+requirements.txt
+README.md
+```
+
+## Limitations and Security Considerations
+
+- The Linux GUI currently calls `audit_linux_shadow` with stop-event and resource-limit parameters that the Linux implementation does not accept. The GUI signature check therefore blocks that workflow before starting the Linux audit.
+- The Linux CLI calls `audit_linux_shadow` without those unsupported parameters and is the currently compatible Linux account-audit interface.
+- The Windows GUI and CLI call the Windows audit without GUI-style candidate limits or a progress callback; the detailed Windows function supports limits internally, but the GUI worker shown in `passguard/gui.py` does not pass them.
+- A non-match means no candidate from the supplied wordlist matched. It is not a guarantee of password strength.
+- Unsupported and failed hash checks are not successful audits and must not be classified as strong passwords.
+- Password-strength scoring is heuristic. The fallback can differ from `zxcvbn`, and a search-space estimate is not a real attacker-cost or compromise assessment.
+- Live compatibility is limited by operating-system policy, installed libraries, account hash formats, registry access, and parser support.
+- Reports retain usernames and sanitized audit metadata. They do not retain plaintext passwords or complete hashes.
+- The `reports` directory and SQLite database are local application artifacts and may contain sensitive account metadata.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).

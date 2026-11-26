@@ -1,466 +1,508 @@
-"""
-passguard.windows_auditor
-=========================
-
-وحدة تدقيق تجزئات NTLM المستخرجة من قاعدة بيانات SAM في Windows.
-
-ملاحظة هامّة عن الاستخراج:
-  قراءة SAM مباشرةً من نظام Windows قيد التشغيل غير ممكنة لأنّ الملف
-  مُقفل من قبل LSM/SAMSERVICE. الإجراء المعتمد (المُصرّح به في فِرق
-  التدقيق) هو استخراج التجزئات بأداة معتمدة مثل impacket's secretsdump:
-
-      secretsdump.py -sam SAM -system SYSTEM LOCAL
-
-  أو تصديرها بصيغة pwdump عبر أدوات مثل fgdump/pwdump8. الأداة هنا
-  تأخذ ملف التجزئات المُستخرَج (أحد الصيغ المدعومة أدناه) وتُفحّصه
-  ضدّ قائمة الكلمات. لا تحاول الأداة نفسها قراءة SAM حيّ، لأنّ ذلك
-  يتطلّب امتيازات SYSTEM وأدوات مستقلة، وهذا فصل صحيح للمسؤوليات.
-
-صيغ الإدخال المدعومة (يتم الكشف التلقائي):
-  1. pwdump/secretsdump:  username:RID:LM:NT:::
-  2. بسيطة:               username:NT
-  3. NTLM فقط:            32-hex
-  4. NTLM فقط مع LM:      LM:NT
-
-الأداء:
-  تجزئة NTLM غير مملّحة (unsalted)، لذا نُسبق حساب NTLM(word) لكل كلمة
-  في القائمة مرة واحدة ونخزّنها في dict، ثم نبحث عن تجزئة كل مستخدم
-  في هذا الـ dict بزمن O(1). هذا أسرع بكثير من إعادة الحساب لكل مستخدم.
-"""
-
+"""Windows local SAM auditing helpers. Use only on systems you administer."""
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
-import re
-import socket
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
 
-from .hash_utils import compute_ntlm, mask_password, get_hash_backend
-from .reporter import AuditReport, Finding, DEFAULT_SEVERITY
-from .wordlist_loader import iter_wordlist, wordlist_stats
-from .sam_reader import (
-    read_sam_hashes as _read_sam_hashes_direct,
-    read_sam_hashes_from_files as _read_sam_hashes_from_files,
-    is_windows as _is_windows,
-    is_admin as _is_admin,
-    hashes_to_pwdump as _hashes_to_pwdump,
-)
-
-# نمط تجزئة NT/LM: 32 حرف hex
-_NT_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-# نمط حساب + تجزئة بسيطة
-_USER_HASH_RE = re.compile(r"^([^:]+):([0-9a-fA-F]{32})$")
-# نمط pwdump: username:RID:LM:NT:::
-_PWDUMP_RE = re.compile(
-    r"^([^:]+):(\d+):([0-9a-fA-F]{32}):([0-9a-fA-F]{32}):.*$"
-)
-# تجزئة فارغة في NT (كلمة مرور فارغة) — تكتب دائماً بأحرف كبيرة
-# لمطابقة convention pwdump/secretsdump ولأنّنا نُطبّق .upper() على كل تجزئة.
-_EMPTY_LM = "AAD3B435B51404EEAAD3B435B51404EE"
-_EMPTY_NT = "31D6CFE0D16AE931B73C59D7E0C089C0"
+from .config import WORDLIST_PATH
+from .wordlist import _load_candidates
+from .password_utils import is_valid_nt_hash, mask_password
 
 
-# ===========================================================================
-# تحليل ملف التجزئات
-# ===========================================================================
-
-def parse_hash_file(path: str) -> List[Dict]:
-    """
-    تحليل ملف تجزئات NTLM.
-
-    يعيد قائمة من dict:
-        {"username": str|None, "lm": str|None, "nt": str, "format": str}
-
-    الصيغ المكتشفة:
-      - pwdump:    "username:RID:LM:NT:::"
-      - user:nt:   "username:NT"
-      - bare-nt:   "NT" فقط (username=None)
-      - lm:nt:     "LM:NT"
-    """
-    entries: List[Dict] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            # pwdump
-            m = _PWDUMP_RE.match(line)
-            if m:
-                username, _rid, lm, nt = m.group(1), m.group(2), m.group(3), m.group(4)
-                entries.append({"username": username, "lm": lm.upper(),
-                                "nt": nt.upper(), "format": "pwdump"})
-                continue
-
-            # LM:NT (كلاهما 32-hex) — يجب التحقق قبل user:nt لأنّ المستخدم
-            # قد يكون نصاً بطول 32 حرفاً من hex (نادر لكن ممكن).
-            parts = line.split(":")
-            if len(parts) == 2 and _NT_HASH_RE.match(parts[0]) and _NT_HASH_RE.match(parts[1]):
-                entries.append({"username": None, "lm": parts[0].upper(),
-                                "nt": parts[1].upper(), "format": "lm:nt"})
-                continue
-
-            # username:NT
-            m = _USER_HASH_RE.match(line)
-            if m:
-                entries.append({"username": m.group(1), "lm": None,
-                                "nt": m.group(2).upper(), "format": "user:nt"})
-                continue
-
-            # NT فقط
-            if _NT_HASH_RE.match(line):
-                entries.append({"username": None, "lm": None,
-                                "nt": line.upper(), "format": "bare-nt"})
-                continue
-
-            # سطر غير معروف — نتخطّاه لكن نسجّله
-            entries.append({"username": None, "lm": None, "nt": None,
-                            "format": "unparsed", "raw": line})
-    return entries
+@dataclass(frozen=True)
+class WindowsAuditResult:
+    username: str
+    state: str
+    details: str
+    hash_value: str
+    hash_algorithm: str
+    hash_source: str = "SAM"
 
 
-# ===========================================================================
-# بناء جدول NTLM(word) → word
-# ===========================================================================
-
-def _build_ntlm_table_worker(wordlist_path: str,
-                              case_fold: bool,
-                              strip: bool) -> Dict[str, str]:
-    """
-    بناء dict {ntlm_hash: word} من قائمة الكلمات.
-    هذه عملية O(wordlist) تُنفّذ مرة واحدة قبل المقارنة.
-    """
-    table: Dict[str, str] = {}
-    for word in iter_wordlist(wordlist_path, case_fold=case_fold, strip=strip):
-        ntlm = compute_ntlm(word)
-        # إن تعارضت تجزئة (نادرة جداً) نُبقي أول ظهور
-        if ntlm not in table:
-            table[ntlm] = word
-    return table
+ProgressCallback = Callable[[int, int, str, int, int], None]
 
 
-# عامل مجزّأ لـ multiprocessing عند بناء الجدول على قوائم ضخمة
-def _table_chunk_worker(args: tuple) -> Dict[str, str]:
-    wordlist_path, start, end, case_fold, strip = args
-    table: Dict[str, str] = {}
-    # نقرأ بـ seek ولكن iter_wordlist لا يدعم الإزاحة مباشرة؛ لذا نستخدم
-    # عدّاد الأسطر ونأخذ الشريحة [start, end)
-    idx = 0
-    for word in iter_wordlist(wordlist_path, case_fold=case_fold, strip=strip):
-        if idx >= end:
-            break
-        if idx >= start:
-            ntlm = compute_ntlm(word)
-            if ntlm not in table:
-                table[ntlm] = word
-        idx += 1
-    return table
+def _ntlm_hash(password: str) -> str:
+    from Crypto.Hash import MD4
+
+    return MD4.new(
+        password.encode("utf-16-le")
+    ).hexdigest().upper()
 
 
-def build_ntlm_table(wordlist_path: str,
-                     case_fold: bool = False,
-                     strip: bool = True,
-                     workers: Optional[int] = None) -> Dict[str, str]:
-    """
-    بناء جدول بحث NTLM(word) → word مع دعم التوازي للقوائم الكبيرة.
-
-    للقوائم الصغيرة-المتوسطة (< ~500 ألف كلمة) يُنفّذ تسلسلياً (أبسط
-    وأسرع بسبب تجنّب الـ IPC). للأكبر، يُقسّم العمل على العمّال.
-    """
-    n_workers = workers or max(1, mp.cpu_count())
-    # تقدير عدد الكلمات من حجم الملف (تقريبي: ~10 بايت/كلمة)
-    size = os.path.getsize(wordlist_path)
-    est_count = max(1, size // 10)
-
-    # عتبة التوازي: ~500 ألف كلمة
-    if est_count < 500_000 or n_workers <= 1:
-        return _build_ntlm_table_worker(wordlist_path, case_fold, strip)
-
-    # توازي مجزّأ
-    chunk_size = max(1, est_count // n_workers)
-    tasks = []
-    for i in range(n_workers):
-        start = i * chunk_size
-        end = (i + 1) * chunk_size if i < n_workers - 1 else est_count + 10_000_000
-        tasks.append((wordlist_path, start, end, case_fold, strip))
-
-    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
-    merged: Dict[str, str] = {}
-    with ctx.Pool(processes=n_workers) as pool:
-        for partial in pool.imap_unordered(_table_chunk_worker, tasks):
-            # نُدمج دون الكتابة فوق الموجود
-            for k, v in partial.items():
-                if k not in merged:
-                    merged[k] = v
-    return merged
-
-
-# ===========================================================================
-# التدقيق الرئيسي
-# ===========================================================================
-
-def audit_windows_hashes(
-    hash_file_path: str,
-    wordlist_path: str = "wordlists/wordlist.txt",
-    case_fold: bool = False,
-    strip: bool = True,
-    workers: Optional[int] = None,
-    progress_cb: Optional[Callable[[str, int, int], None]] = None,
-) -> AuditReport:
-    """
-    تدقيق ملف تجزئات NTLM ضدّ قائمة كلمات مرور شائعة.
-
-    المعاملات:
-        hash_file_path:  مسار ملف التجزئات (pwdump أو user:nt أو bare).
-        wordlist_path:   مسار ملف القائمة.
-        case_fold:       تطبيع الحالة.
-        strip:           إزالة المسافات.
-        workers:         عدد العمّال.
-        progress_cb:     دالة استدعاء للتقدّم (msg, done, total).
-
-    يعيد AuditReport.
-    """
-    start = time.time()
-
-    # --- تحقّق الإدخال ---
-    if not hash_file_path or not os.path.exists(hash_file_path):
-        raise FileNotFoundError(f"ملف التجزئات غير موجود: {hash_file_path}")
-    if os.path.getsize(hash_file_path) == 0:
-        raise ValueError(f"ملف التجزئات فارغ: {hash_file_path}")
-    if not wordlist_path or not os.path.exists(wordlist_path):
-        raise FileNotFoundError(f"ملف القائمة غير موجود: {wordlist_path}")
+def _terminate_process(process: subprocess.Popen) -> None:
+    """Stop a registry export process and reap it."""
+    if process.poll() is not None:
+        return
 
     try:
-        wstats = wordlist_stats(wordlist_path)
-        wl_count = wstats["word_count"]
-    except Exception:
-        wl_count = 0
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
 
-    if progress_cb:
-        progress_cb(f"بناء جدول NTLM لـ {wl_count} كلمة من القائمة...", 0, 0)
-
-    # بناء جدول NTLM(word) → word (مرة واحدة)
-    table = build_ntlm_table(wordlist_path, case_fold=case_fold,
-                             strip=strip, workers=workers)
-    if progress_cb:
-        progress_cb(f"اكتمل بناء الجدول: {len(table)} تجزئة فريدة.", 0, 0)
-
-    # تحليل ملف التجزئات
-    entries = parse_hash_file(hash_file_path)
-    if not entries:
-        raise ValueError(f"لم يُعثر على تجزئات صالحة في الملف: {hash_file_path}")
-    if progress_cb:
-        progress_cb(f"تدقيق {len(entries)} تجزئة...", 0, len(entries))
-
-    report = AuditReport()
-    report.source_platform = "windows"
-    report.hostname = socket.gethostname()
-    report.wordlist_path = os.path.abspath(wordlist_path)
-    report.wordlist_count = wl_count
-    report.hash_backend = get_hash_backend()
-    # بيانات وصفية عن أنواع الصيغ المكتشفة
-    format_counts: Dict[str, int] = {}
-    for e in entries:
-        fmt = e.get("format", "unknown")
-        format_counts[fmt] = format_counts.get(fmt, 0) + 1
-    report.metadata["hash_file"] = os.path.abspath(hash_file_path)
-    report.metadata["format_distribution"] = format_counts
-    report.metadata["table_size"] = len(table)
-
-    done = 0
-    for e in entries:
-        done += 1
-        if e.get("format") == "unparsed":
-            report.add(Finding(
-                username="(unparsed-line)",
-                source="windows-ntlm",
-                algorithm="—",
-                status="unknown",
-                matched_password_masked=None,
-                hash_preview=None,
-                severity="info",
-                notes=f"سطر غير مفهوم: {e.get('raw', '')[:60]}",
-            ))
-            continue
-
-        nt = e["nt"]
-        if nt is None:
-            report.add(Finding(
-                username=e.get("username") or "(unknown)",
-                source="windows-ntlm",
-                algorithm="—",
-                status="unknown",
-                matched_password_masked=None,
-                hash_preview=None,
-                severity="info",
-                notes="تعذّر استخراج تجزئة NT.",
-            ))
-            continue
-
-        username = e.get("username") or "(unknown)"
-        hash_preview = f"NT | {nt[:8]}…"
-
-        # تجزئة NT فارغة (لا كلمة مرور)
-        if nt.upper() == _EMPTY_NT:
-            report.add(Finding(
-                username=username,
-                source="windows-ntlm",
-                algorithm="NTLM",
-                status="empty",
-                matched_password_masked=None,
-                hash_preview=hash_preview,
-                severity="high",
-                notes="الحساب بدون كلمة مرور (تجزئة NT الفارغة).",
-            ))
-        elif nt.upper() in table:
-            word = table[nt.upper()]
-            report.add(Finding(
-                username=username,
-                source="windows-ntlm",
-                algorithm="NTLM",
-                status="weak",
-                matched_password_masked=mask_password(word),
-                hash_preview=hash_preview,
-                severity="critical",
-                notes="كلمة المرور مطابقة لإدخال في القائمة الشائعة.",
-            ))
-        else:
-            # لم تُطابق — هذا لا يعني الأمان، فقط أنّ القائمة المُستخدمة لم تكشفها
-            report.add(Finding(
-                username=username,
-                source="windows-ntlm",
-                algorithm="NTLM",
-                status="no_match",
-                matched_password_masked=None,
-                hash_preview=hash_preview,
-                severity="low",
-                notes="لم تُطابق أي كلمة في القائمة المُستخدمة — هذا لا يعني الأمان.",
-            ))
-
-        if progress_cb and done % 50 == 0:
-            progress_cb(f"تم تدقيق {done}/{len(entries)} تجزئة.", done, len(entries))
-
-    report.duration_seconds = time.time() - start
-    if progress_cb:
-        progress_cb("اكتمل التدقيق.", done, len(entries))
-
-    return report
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
-def audit_windows_sam_from_files(
+def _backup_sam_hives(
+    temp_dir: str,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Export SAM and SYSTEM hives.
+
+    The reg.exe subprocess is monitored so Stop and the duration limit can
+    terminate an export that is still running.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    sam_path = os.path.join(temp_dir, "SAM")
+    system_path = os.path.join(temp_dir, "SYSTEM")
+
+    for hive, target in (
+        (r"hklm\sam", sam_path),
+        (r"hklm\system", system_path),
+    ):
+        if stop_event.is_set():
+            return None, "Stopped by user"
+
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None, "Maximum duration reached"
+
+        try:
+            process = subprocess.Popen(
+                ["reg", "save", hive, target, "/y"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as error:
+            return None, f"Unable to start registry export: {error}"
+
+        while process.poll() is None:
+            if stop_event.is_set():
+                _terminate_process(process)
+                return None, "Stopped by user"
+
+            if deadline is not None and time.perf_counter() >= deadline:
+                _terminate_process(process)
+                return None, "Maximum duration reached during registry export"
+
+            time.sleep(0.05)
+
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            message = (stderr or stdout or "").strip()
+            return (
+                None,
+                message or "Failed to export the Windows registry hive",
+            )
+
+    return sam_path, system_path
+
+
+def extract_windows_ntlm_hashes(
     sam_path: str,
     system_path: str,
-    wordlist_path: str,
-    case_fold: bool = False,
-    strip: bool = True,
-    workers: Optional[int] = None,
-    progress_cb: Optional[Callable[[str, int, int], None]] = None,
-) -> AuditReport:
-    """تدقيق تجزئات SAM من ملفات خلايا مُصدَّرة (SAM.save + SYSTEM.save).
+) -> dict[str, str]:
+    """Extract account NT hashes from exported SAM and SYSTEM hives."""
 
-    يتطلّب أن تكون خليتا SAM وSYSTEM مُصدَّرتين مسبقاً (عبر ``reg save`` أو
-    ``save_registry_hive``). تعمل هذه الدالة على أيّ منصة.
+    hashes: dict[str, str] = {}
 
-    المعاملات:
-        sam_path:     مسار ملف خلية SAM المُصدَّر.
-        system_path:  مسار ملف خلية SYSTEM المُصدَّر.
-        wordlist_path: مسار ملف القائمة.
-
-    يعيد AuditReport.
-    """
-    start = time.time()
-    if progress_cb:
-        progress_cb("قراءة تجزئات SAM من ملفات الخلايا المُصدَّرة...", 0, 0)
-
-    hashes = _read_sam_hashes_from_files(sam_path, system_path)
-    if progress_cb:
-        progress_cb(f"استُخرجت {len(hashes)} تجزئة من SAM.", 0, len(hashes))
-
-    # تحويل إلى صيغة pwdump مؤقتة وإعادة استخدام parse_hash_file
-    pwdump_text = _hashes_to_pwdump(hashes)
-    tmp_path = sam_path + ".pwdump.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(pwdump_text)
     try:
-        report = audit_windows_hashes(
-            hash_file_path=tmp_path,
-            wordlist_path=wordlist_path,
-            case_fold=case_fold, strip=strip,
-            workers=workers, progress_cb=progress_cb)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-    report.metadata["sam_source"] = "exported-hives"
-    report.metadata["sam_path"] = os.path.abspath(sam_path)
-    report.metadata["system_path"] = os.path.abspath(system_path)
-    report.metadata["direct_read"] = False
-    return report
+        from pypykatz.registry.offline_parser import OffineRegistry
 
+        registry = OffineRegistry.from_files(
+            system_path,
+            sam_path,
+        )
 
-def audit_windows_sam_direct(
-    wordlist_path: str,
-    case_fold: bool = False,
-    strip: bool = True,
-    workers: Optional[int] = None,
-    progress_cb: Optional[Callable[[str, int, int], None]] = None,
-) -> AuditReport:
-    """تدقيق SAM مباشرة من نظام Windows الحيّ (يتطلّب Windows + admin).
+        sam_data = registry.to_dict().get("SAM", {})
 
-    سير العمل:
-      1. التحقّق من Windows + صلاحيات admin.
-      2. تمكين SE_BACKUP_PRIVILEGE.
-      3. تصدير خليتي SAM وSYSTEM عبر RegSaveKeyEx (مكتبة advapi32 القياسية).
-      4. استخراج تجزئات NTLM من الخلايا المُصدَّرة (RC4 + DES فكّ تشفير).
-      5. تدقيق التجزئات ضدّ القائمة.
+        users = (
+            sam_data.get("local_users", [])
+            if isinstance(sam_data, dict)
+            else []
+        )
 
-    يعيد AuditReport. يرفع RuntimeError على غير-Windows، PermissionError بدون admin.
-    """
-    if not _is_windows():
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+
+            username = str(
+                user.get("username", "")
+            ).strip()
+
+            nt_hash = user.get("nt_hash", b"")
+
+            if isinstance(nt_hash, bytes):
+                nt_hash = nt_hash.hex()
+
+            nt_hash = str(nt_hash).upper()
+
+            if username and nt_hash and nt_hash not in (
+                "",
+                "31D6CFE0D16AE931B73C59D7E0C089C0",
+            ):
+                hashes[username] = nt_hash
+
+    except ImportError as error:
         raise RuntimeError(
-            "القراءة المباشرة من SAM تتطلّب Windows. "
-            "استخدم audit_windows_sam_from_files() مع ملفات خلايا مُصدَّرة.")
-    if not _is_admin():
-        raise PermissionError(
-            "القراءة المباشرة من SAM تتطلّب صلاحيات Administrator. "
-            "أعد تشغيل الأداة كـ Administrator.")
+            "The pypykatz library is unavailable"
+        ) from error
 
-    if progress_cb:
-        progress_cb("تصدير خليتي SAM وSYSTEM (RegSaveKeyEx)...", 0, 0)
+    except Exception as error:
+        raise RuntimeError(
+            f"Unable to read SAM hashes: {error}"
+        ) from error
 
-    import shutil
-    import tempfile
-    tmp = tempfile.mkdtemp(prefix="passguard-sam-audit-")
+    return hashes
+
+
+def audit_windows_detailed_report(
+    wordlist_path: str | Path = WORDLIST_PATH,
+    progress_callback: ProgressCallback | None = None,
+    *,
+    max_candidates: int | None = None,
+    max_duration_seconds: float | None = None,
+    rate_limit: float | None = None,
+    stop_event: threading.Event | None = None,
+    stop_on_first_match: bool = False,
+) -> tuple[list[WindowsAuditResult], str]:
+    """
+    Audit local Windows SAM hashes.
+
+    max_candidates is a total candidate limit for this audit.
+    max_duration_seconds is the maximum overall audit duration.
+    rate_limit is candidates per second (None means unlimited).
+    stop_event is set by the GUI to request cancellation.
+    stop_on_first_match stops the full audit after the first match.
+    """
+
+    if sys.platform != "win32":
+        return [], "This audit is available on Windows only."
+
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    if max_candidates is not None:
+        max_candidates = max(1, int(max_candidates))
+
+    if max_duration_seconds is not None:
+        max_duration_seconds = max(0.1, float(max_duration_seconds))
+
+    if rate_limit is not None:
+        rate_limit = max(0.1, float(rate_limit))
+
+    started_at = time.perf_counter()
+    deadline = (
+        started_at + max_duration_seconds
+        if max_duration_seconds is not None
+        else None
+    )
+
+    def stop_reason(checked: int) -> str | None:
+        if stop_event.is_set():
+            return "Stopped by user"
+
+        if deadline is not None and time.perf_counter() >= deadline:
+            return "Maximum duration reached"
+
+        if (
+            max_candidates is not None
+            and checked >= max_candidates
+        ):
+            return "Maximum candidate limit reached"
+
+        return None
+
+    if stop_event.is_set():
+        return [], "Audit stopped by user before starting."
+
+    temp_dir = tempfile.mkdtemp(prefix="pwaudit_")
+
     try:
-        os.chmod(tmp, 0o700)
-    except (AttributeError, OSError):
-        pass
-    if os.name == "nt":
-        from .sam_reader import _restrict_windows_temp_directory
-        _restrict_windows_temp_directory(tmp)
-    sam_path = os.path.join(tmp, "SAM.save")
-    system_path = os.path.join(tmp, "SYSTEM.save")
+        sam_path, system_path = _backup_sam_hives(
+            temp_dir,
+            stop_event=stop_event,
+            deadline=deadline,
+        )
 
-    try:
-        from .sam_reader import save_registry_hive
-        save_registry_hive("SAM", sam_path)
-        save_registry_hive("SYSTEM", system_path)
-        report = audit_windows_sam_from_files(
-            sam_path, system_path, wordlist_path,
-            case_fold=case_fold, strip=strip,
-            workers=workers, progress_cb=progress_cb)
-        report.metadata["direct_read"] = True
-        report.metadata["sam_source"] = "live-system-regsavekeyex"
-        return report
-    finally:
+        if sam_path is None:
+            message = system_path or "Unknown reason"
+
+            if message.startswith("Stopped"):
+                return [], f"Audit stopped: {message}."
+
+            if message.startswith("Maximum duration"):
+                return [], f"Audit stopped: {message}."
+
+            return [], f"Registry backup failed: {message}"
+
+        reason = stop_reason(0)
+        if reason is not None:
+            return [], f"Audit stopped: {reason}."
+
         try:
-            shutil.rmtree(tmp)
-        except OSError:
-            pass
+            user_hashes = extract_windows_ntlm_hashes(
+                sam_path,
+                system_path,
+            )
+        except RuntimeError as error:
+            return [], str(error)
+
+        reason = stop_reason(0)
+        if reason is not None:
+            rows = [
+                WindowsAuditResult(
+                    username,
+                    "Not audited",
+                    reason,
+                    nt_hash,
+                    "NT Hash (NTLM)"
+                    if is_valid_nt_hash(nt_hash)
+                    else "Unknown",
+                )
+                for username, nt_hash in user_hashes.items()
+            ]
+            return rows, f"Audit stopped: {reason}. SAM extraction completed; password candidates were not tested."
+
+        results: dict[str, tuple[str, str]] = {}
+        valid_hashes: dict[str, str] = {}
+
+        for username, nt_hash in user_hashes.items():
+            if is_valid_nt_hash(nt_hash):
+                valid_hashes[username] = nt_hash
+                results[username] = ("Not in wordlist", "No match")
+            else:
+                results[username] = (
+                    "Error",
+                    "Invalid NT hash format; account not evaluated",
+                )
+
+        candidates = _load_candidates(wordlist_path)
+
+        if not candidates:
+            for username in valid_hashes:
+                results[username] = (
+                    "Error",
+                    "Wordlist is unavailable or empty; account not evaluated",
+                )
+
+            rows = [
+                WindowsAuditResult(
+                    username,
+                    state,
+                    details,
+                    user_hashes[username],
+                    "NT Hash (NTLM)"
+                    if is_valid_nt_hash(user_hashes[username])
+                    else "Unknown",
+                )
+                for username, (state, details) in results.items()
+            ]
+
+            return rows, (
+                f"Extracted {len(results)} active accounts, but the wordlist "
+                "is unavailable or empty. No accounts were evaluated."
+            )
+
+        checked = 0
+        matches_found = 0
+        audit_stop_reason = None
+
+        total_to_check = (
+            min(len(candidates), max_candidates)
+            if max_candidates is not None
+            else len(candidates)
+        )
+
+        next_candidate_at = time.perf_counter()
+        interval = 1.0 / rate_limit if rate_limit else None
+        last_progress_at = 0.0
+
+        def report_progress(force: bool = False) -> None:
+            nonlocal last_progress_at
+
+            if progress_callback is None:
+                return
+
+            now = time.perf_counter()
+
+            if force or now - last_progress_at >= 0.35:
+                last_progress_at = now
+                progress_callback(
+                    len(user_hashes),
+                    len(user_hashes),
+                    "SAM accounts",
+                    checked,
+                    total_to_check,
+                )
+
+        if valid_hashes:
+            for word in candidates:
+                audit_stop_reason = stop_reason(checked)
+                if audit_stop_reason is not None:
+                    break
+
+                # Rate limit is cancellation-aware.
+                if interval is not None:
+                    while True:
+                        audit_stop_reason = stop_reason(checked)
+                        if audit_stop_reason is not None:
+                            break
+
+                        remaining = next_candidate_at - time.perf_counter()
+                        if remaining <= 0:
+                            break
+
+                        stop_event.wait(min(remaining, 0.1))
+
+                    if audit_stop_reason is not None:
+                        break
+
+                checked += 1
+
+                candidate_hash = _ntlm_hash(word)
+
+                for username, nt_hash in list(valid_hashes.items()):
+                    if candidate_hash == nt_hash:
+                        results[username] = (
+                            "Weak",
+                            mask_password(word),
+                        )
+                        del valid_hashes[username]
+                        matches_found += 1
+
+                        if stop_on_first_match:
+                            audit_stop_reason = "Stopped after first match"
+                            break
+
+                report_progress()
+
+                if audit_stop_reason is not None:
+                    break
+
+                if not valid_hashes:
+                    # Every valid account hash has been matched.
+                    break
+
+                if interval is not None:
+                    next_candidate_at += interval
+
+        # Do not report a limit as an interruption when the wordlist was
+        # fully consumed or every valid account hash was already matched.
+        if (
+            audit_stop_reason is None
+            and valid_hashes
+            and checked < len(candidates)
+        ):
+            audit_stop_reason = stop_reason(checked)
+
+        # A stopped or limited audit must not label untested accounts
+        # as "Not in wordlist".
+        if audit_stop_reason is not None:
+            for username in valid_hashes:
+                results[username] = (
+                    "Not audited",
+                    audit_stop_reason,
+                )
+
+        rows = [
+            WindowsAuditResult(
+                username,
+                state,
+                details,
+                user_hashes[username],
+                "NT Hash (NTLM)"
+                if is_valid_nt_hash(user_hashes[username])
+                else "Unknown",
+            )
+            for username, (state, details) in results.items()
+        ]
+
+        weak_count = sum(
+            1 for row in rows if row.state == "Weak"
+        )
+        invalid_count = sum(
+            not is_valid_nt_hash(row.hash_value)
+            for row in rows
+        )
+        elapsed = time.perf_counter() - started_at
+
+        if progress_callback is not None:
+            report_progress(force=True)
+
+        if audit_stop_reason is not None:
+            summary = (
+                f"Audit stopped: {audit_stop_reason}. "
+                f"Extracted {len(rows)} active accounts, "
+                f"checked {checked:,} candidates, "
+                f"found {weak_count} weak passwords "
+                f"in {elapsed:.1f} seconds."
+            )
+        else:
+            summary = (
+                f"Extracted {len(rows)} active accounts and "
+                f"checked {checked:,} candidates. "
+                f"Found {weak_count} weak passwords "
+                f"in {elapsed:.1f} seconds."
+            )
+
+        if invalid_count:
+            summary += (
+                f" {invalid_count} invalid NT hash formats "
+                "were not evaluated."
+            )
+
+        return rows, summary
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-__all__ = ["audit_windows_hashes", "audit_windows_sam_direct",
-           "audit_windows_sam_from_files", "parse_hash_file", "build_ntlm_table"]
+def audit_windows_report(
+    wordlist_path: str | Path = WORDLIST_PATH,
+    progress_callback: ProgressCallback | None = None,
+    *,
+    max_candidates: int | None = None,
+    max_duration_seconds: float | None = None,
+    rate_limit: float | None = None,
+    stop_event: threading.Event | None = None,
+    stop_on_first_match: bool = False,
+) -> tuple[list[tuple[str, str, str]], str]:
+    """Preserve the legacy three-column result interface used by the CLI."""
+
+    results, summary = audit_windows_detailed_report(
+        wordlist_path,
+        progress_callback,
+        max_candidates=max_candidates,
+        max_duration_seconds=max_duration_seconds,
+        rate_limit=rate_limit,
+        stop_event=stop_event,
+        stop_on_first_match=stop_on_first_match,
+    )
+
+    return [
+        (result.username, result.state, result.details)
+        for result in results
+    ], summary
